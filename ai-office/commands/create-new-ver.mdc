@@ -1,0 +1,38 @@
+---
+description: Command alias create_new_ver — clone next mt5-bot strategy version (not a global office standard)
+alwaysApply: true
+---
+
+# Command Alias: create_new_ver
+
+**Scope:** MetaTrader strategy folders under `mt5-bot/`. This file is `ai-office/commands/create-new-ver.mdc`, separate from `ai-office/global/` office-wide standards.
+
+When user message contains `create_new_ver`, treat it as a standard version-clone command for strategy folders in `mt5-bot/`.
+
+## Expected command format
+
+`create_new_ver <source_folder> <target_folder>`
+
+Example:
+- `create_new_ver 559.007 559.008`
+- `create_new_ver 559.006_ATR 559.007`
+
+## Required behavior
+
+1. Determine source as `mt5-bot/<source_folder>` and target as `mt5-bot/<target_folder>`.
+2. Copy all strategy files/folders.
+3. Exclude old artifacts:
+   - `**/*.ex5`
+   - `trade_logs/*.log`
+4. Rename files where version is embedded in filename (EA/Core/Strategy/InfoPanel/Tracker).
+5. Replace version/path references inside copied text files (`.mq5`, `.mqh`, `.md`, `.txt`, `.tpl`):
+   - old version token -> new version token
+   - old folder token -> new folder token
+6. Keep template/readme structure (`tasks/README.md`, `trade_logs/README.md`) and update version/path text there too.
+7. Never copy binary compiled artifacts from source into target.
+
+## Safety checks after copy
+
+- Verify there are no `.ex5` files in target.
+- Verify there are no old `.log` files in target `trade_logs/`.
+- Verify no old version string remains in target files.
