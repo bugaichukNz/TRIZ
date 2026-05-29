@@ -1,0 +1,65 @@
+---
+description: Formal handoff contracts — who may assign/receive work; single user-facing entry (Team Lead)
+globs:
+alwaysApply: true
+---
+
+# Handoff Contracts (mandatory)
+
+These contracts define **valid edges** in the workflow.
+
+**User-facing (official project work):** Only **Team Lead** is user-facing for **implementation outcomes, merge/release approval, and standard routed analytics** (Quant). **Programmer**, **Tester**, and **Quant** are **internal execution roles**; they **must not** deliver final implementation work, QA sign-off, merge approval, or **Quant** analytics conclusions directly to the **user** (TL delivers those).
+
+**Information Security Officer (Ися)** is covered in **§6** — **dual entry:** Team Lead assignment **or** **direct user invoke** for security reviews; **merge/release authority** remains with Team Lead per policy.
+
+## 1. User → Team Lead (primary user-facing entry)
+
+- **User assigns work to the Team Lead (Туся):** implementation, specs, requests that need **Quant** analysis (strategy/logs/backtests, etc.), and **formal security reviews** that TL routes to **Ися**.
+- User does **not** assign tasks directly to Programmer (Пуся), Tester (Труся), or **Quant (Кася)**.
+- User receives from Team Lead: **implementation outcomes**, **analytics summaries** (from routed Quant work), **review conclusions**, and **user-facing packaging** of security posture when TL integrates Infosec findings.
+- **Direct Infosec invoke:** The user **may** start a **security review** by **explicitly invoking Infosec (Ися)** (e.g. dedicated agent/rule in Cursor). **Ися may respond** with **technical security findings** in that context. **Official** merge/release decisions still follow **Team Lead** + **`approval-policy`**. For audit trail, Ися should provide a **written summary** to TL when the engagement was direct-invoke and the outcome must sit on the **release record**.
+
+## 2. Team Lead → Programmer
+
+- **Only the Team Lead** assigns implementation tasks to the Programmer (from approved EPIC/Story/Task).
+- Programmer **must not** accept or act on **direct user requests** for implementation work (see `ai-office/agents/programmer/role.mdc`).
+
+## 3. Programmer → Tester
+
+- Programmer hands completed work to **Tester only** using the unified format in `ai-office/templates/programmer-handoff-template.md`.
+- Programmer does **not** hand implementation results directly to the Team Lead for “done” — only to the **Tester**; Team Lead sees the outcome **after** QA sign-off.
+
+## 4. Tester → Team Lead
+
+- Tester hands to Team Lead **only after** QA checklist passes (`ai-office/checklists/qa-checklist.md`).
+- Tester **must not** accept tasks from the **user** or **directly from Team Lead** for normal QA gating (see `ai-office/agents/tester/role.mdc` for exceptions).
+
+## 5. Team Lead ↔ Quant (Кася) — not user-facing
+
+- **Quant is not user-facing.** Quant does **not** accept direct user requests for official analysis work.
+- **Team Lead** assigns analysis tasks to Quant (scope, paths, questions) and **delivers Quant’s output to the user**.
+- Quant hands analytical results to **Team Lead** (or via agreed internal handoff), **not** to the user directly.
+- If Quant concludes that **code or repo changes** are needed, Quant notifies **Team Lead only** — not Programmer. Team Lead then runs the implementation pipeline (Programmer → Tester → Team Lead) as usual.
+
+## 6. Team Lead ↔ Infosec (Ися) — security reviews
+
+- **Ися is not merge/release authority.** Final **merge approval** and **deploy/release sign-off** stay with **Team Lead** per `ai-office/policies/approval-policy.md` and `ai-office/policies/deployment-policy.md`.
+- **Team Lead** may assign Infosec: scope (architecture, code paths, infra, integration), questions, branch/PR/release context. Infosec returns **findings** to **Team Lead**; TL integrates into user-facing summaries and decisions.
+- **Direct user → Ися:** Allowed when the user **explicitly invokes** the Infosec role for a **security review**. Ися **must not** assign **Programmer** directly; if implementation is required, Ися notifies **Team Lead only** — TL runs Programmer → Tester → TL.
+- Infosec validates against **`ai-office/global/security-baseline.mdc`**, security items in **`ai-office/checklists/review-checklist.md`**, and **`docs/security-checklist.md`** when present.
+- Non-trivial Infosec outputs should use **`ai-office/templates/infosec-findings-template.md`**.
+
+## 7. Artifact format
+
+- All role handoffs that are not trivial one-liners **must** use templates from `ai-office/templates/` so format stays consistent.
+
+## Enforcement rule
+
+Any violation of routing, QA flow, or approval policy invalidates the task result.
+
+If a violation is detected:
+
+- the task must be restarted from Team Lead
+- previous results are considered non-compliant
+
+**Path convention:** Cross-references in this office use paths from the repository root, e.g. `ai-office/global/handoff-contracts.mdc`, `ai-office/checklists/qa-checklist.md`.
