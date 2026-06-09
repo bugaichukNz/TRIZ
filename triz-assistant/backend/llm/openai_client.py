@@ -36,13 +36,23 @@ def create_chat_llm(*, temperature: float = 0.25) -> ChatOpenAI:
 
 
 
+    timeout = httpx.Timeout(30.0, read=180.0)
+
     if settings.openai_proxy_url:
 
-        kwargs["http_client"] = httpx.Client(proxy=settings.openai_proxy_url)
+        kwargs["http_client"] = httpx.Client(
+
+            proxy=settings.openai_proxy_url,
+
+            timeout=timeout,
+
+        )
 
         kwargs["http_async_client"] = httpx.AsyncClient(
 
-            proxy=settings.openai_proxy_url
+            proxy=settings.openai_proxy_url,
+
+            timeout=timeout,
 
         )
 

@@ -34,6 +34,12 @@ class Settings(BaseSettings):
 
     llm_model: str = "gpt-4o-mini"
 
+    database_url: str = "sqlite:///data/sessions/triz.db"
+
+    history_max_entries: int = 20
+
+    chat_sessions_max: int = 50
+
 
 
 
