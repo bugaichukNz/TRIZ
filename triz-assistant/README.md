@@ -39,6 +39,7 @@ cp .env.example .env
 | `OPENAI_PROXY_URL` | HTTP-прокси, например `http://user:pass@host:port` |
 | `LLM_MODEL` | Модель, например `gpt-4o-mini` |
 | `BACKEND_URL` | URL backend для Streamlit |
+| `DATABASE_URL` | SQLite для истории (`sqlite:///data/sessions/triz.db`) |
 
 ---
 
@@ -77,6 +78,16 @@ python scripts/test_pipeline.py
 |-------|------|----------|
 | `GET` | `/health` | Статус сервера и LLM |
 | `POST` | `/solve` | `{"problem": "..."}` — экспертный TRIZ-отчёт |
+| `GET` | `/sessions` | История TRIZ-отчётов (`?limit=20`) |
+| `POST` | `/sessions` | Добавить запись в историю |
+| `DELETE` | `/sessions` | Очистить историю |
+| `GET` | `/chat/sessions` | Список сохранённых диалогов |
+| `POST` | `/chat/sessions` | Новый диалог |
+| `GET` | `/chat/sessions/{id}` | Состояние диалога (все сообщения) |
+| `POST` | `/chat/sessions/{id}/messages` | Сообщение в интервью |
+| `POST` | `/chat/sessions/{id}/analyze` | TRIZ-анализ после интервью |
+
+Все данные (диалоги, отчёты, активный диалог) хранятся только в SQLite (`data/sessions/triz.db`) и отображаются в левом меню Streamlit. При первом запуске данные из старого `history.json` импортируются в БД автоматически. Лимиты: `HISTORY_MAX_ENTRIES`, `CHAT_SESSIONS_MAX` в `.env`.
 
 ---
 

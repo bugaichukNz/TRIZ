@@ -62,11 +62,55 @@ html, body, [class*="css"] {
 
 
 
-#MainMenu, footer, header[data-testid="stHeader"] {
+#MainMenu, footer {
 
     visibility: hidden;
 
     height: 0;
+
+}
+
+
+
+/* Кнопка «☰» для раскрытия левого меню (в шапке Streamlit) */
+
+header[data-testid="stHeader"] {
+
+    visibility: visible !important;
+
+    height: auto !important;
+
+    background: transparent !important;
+
+}
+
+
+
+[data-testid="stSidebarCollapseButton"],
+
+[data-testid="collapsedControl"],
+
+button[data-testid="stBaseButton-headerNoPadding"] {
+
+    visibility: visible !important;
+
+    display: flex !important;
+
+    opacity: 1 !important;
+
+    pointer-events: auto !important;
+
+    z-index: 999999 !important;
+
+}
+
+
+
+section[data-testid="stSidebar"] {
+
+    min-width: 280px;
+
+    z-index: 999990;
 
 }
 
@@ -530,13 +574,29 @@ section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"]:has(.sidebar-
 
 }
 
-section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"]:has(.sidebar-history-title) > div[data-testid="column"]:last-child {
+section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"]:has(.sidebar-history-title) > div[data-testid="column"]:not(:first-child) {
 
-    flex: 0 0 4.5rem !important;
+    flex: 0 0 2.25rem !important;
 
-    width: 4.5rem !important;
+    width: 2.25rem !important;
 
-    min-width: 4.5rem !important;
+    min-width: 2.25rem !important;
+
+    max-width: 2.25rem !important;
+
+}
+
+
+
+section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"]:has(.sidebar-history-title) > div[data-testid="column"] .stPopover > button {
+
+    min-height: 1.75rem !important;
+
+    padding: 0.2rem 0.35rem !important;
+
+    font-size: 0.85rem !important;
+
+    width: 100% !important;
 
 }
 

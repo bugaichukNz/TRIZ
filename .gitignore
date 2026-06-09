@@ -1,0 +1,50 @@
+# --- Secrets & local config ---
+.env
+.env.local
+*.env.local
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+pip-wheel-metadata/
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# --- TRIZ Assistant runtime data ---
+triz-assistant/data/sessions/*.db
+triz-assistant/data/sessions/*.db-journal
+triz-assistant/data/sessions/history.json
+
+# --- Streamlit ---
+.streamlit/secrets.toml
+
+# --- IDE & OS ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Logs & temp ---
+*.log
+*.tmp
+.cache/

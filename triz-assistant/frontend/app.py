@@ -7,13 +7,27 @@ from datetime import datetime
 import requests
 import streamlit as st
 
+from chat_client import (
+    CHAT_OPENING_MESSAGE,
+    analyze_chat_session,
+    complete_chat_session,
+    create_chat_session,
+    delete_all_chat_sessions,
+    delete_chat_session,
+    get_chat_session,
+    list_chat_sessions,
+    send_chat_message,
+)
+from history_client import clear_history_api, fetch_history, fetch_history_entry
+from state_client import fetch_active_chat, save_active_chat
 from report_builder import build_report_html
 from theme import inject_theme
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 SOLVE_ENDPOINT = "/solve"
 HEALTH_ENDPOINT = "/health"
-HISTORY_LIMIT = 5
+HISTORY_LIMIT = int(os.getenv("HISTORY_MAX_ENTRIES", "20"))
+CHAT_LIST_LIMIT = int(os.getenv("CHAT_SESSIONS_MAX", "50"))
 MIN_PROBLEM_LENGTH = 3
 MAX_PROBLEM_LENGTH = 4000
 
@@ -22,12 +36,19 @@ st.set_page_config(
     page_icon="💡",
     layout="wide",
     initial_sidebar_state="expanded",
+    menu_items={
+        "Get help": None,
+        "Report a bug": None,
+        "About": None,
+    },
 )
 
 inject_theme()
 
 if "history" not in st.session_state:
     st.session_state.history = []
+if "db_menu_error" not in st.session_state:
+    st.session_state.db_menu_error = None
 if "last_result" not in st.session_state:
     st.session_state.last_result = None
 if "last_problem" not in st.session_state:
@@ -38,13 +59,53 @@ if "report_docx" not in st.session_state:
     st.session_state.report_docx = None
 if "view" not in st.session_state:
     st.session_state.view = "home"
+if "chat_session_id" not in st.session_state:
+    st.session_state.chat_session_id = None
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = []
+if "chat_status" not in st.session_state:
+    st.session_state.chat_status = None
+if "chat_sessions" not in st.session_state:
+    st.session_state.chat_sessions = []
+if "active_chat_restored" not in st.session_state:
+    st.session_state.active_chat_restored = False
+if "menu_loaded" not in st.session_state:
+    st.session_state.menu_loaded = False
 
-# Просмотр отчёта без st.switch_page (надёжно при Streamlit multipage v2)
-if st.session_state.view == "report":
-    from report_view import render_report_page
 
-    render_report_page(show_back=True)
-    st.stop()
+def _backend_base() -> str:
+    return st.session_state.get("backend_url", BACKEND_URL).rstrip("/")
+
+
+def reload_menu_from_db() -> bool:
+    """Загружает диалоги и отчёты из SQLite (через API)."""
+    base = _backend_base()
+    try:
+        st.session_state.chat_sessions = list_chat_sessions(
+            base, limit=CHAT_LIST_LIMIT
+        )
+        st.session_state.history = fetch_history(base, limit=HISTORY_LIMIT)
+        st.session_state.db_menu_error = None
+        st.session_state.menu_loaded = True
+        return True
+    except requests.RequestException as exc:
+        st.session_state.db_menu_error = (
+            f"Не удалось загрузить меню из БД: {exc}"
+        )
+        return False
+
+
+def ensure_menu_loaded() -> None:
+    """Загружает меню один раз за сессию (не на каждый rerun)."""
+    if not st.session_state.menu_loaded:
+        reload_menu_from_db()
+
+
+def _history_entry_with_result(item: dict) -> dict:
+    """Подгружает полный отчёт, если в меню только краткая запись."""
+    if item.get("result"):
+        return item
+    return fetch_history_entry(_backend_base(), item["id"])
 
 
 def build_reports(problem: str, result: dict) -> None:
@@ -60,10 +121,6 @@ def build_reports(problem: str, result: dict) -> None:
     except Exception as exc:
         st.session_state.report_docx = None
         st.warning(f"DOCX не сформирован: {exc}")
-
-
-def _backend_base() -> str:
-    return st.session_state.get("backend_url", BACKEND_URL).rstrip("/")
 
 
 def check_backend_health() -> tuple[bool, str]:
@@ -111,14 +168,10 @@ def call_solve_api(problem: str) -> dict:
     return response.json()
 
 
-def add_to_history(problem: str, result: dict) -> None:
-    """Добавляет запрос в историю (не более HISTORY_LIMIT записей)."""
-    entry = {
-        "problem": problem,
-        "result": result,
-        "time": datetime.now().strftime("%d.%m.%Y %H:%M"),
-    }
-    st.session_state.history = [entry, *st.session_state.history][:HISTORY_LIMIT]
+def clear_history() -> None:
+    """Очищает отчёты в SQLite."""
+    clear_history_api(_backend_base())
+    st.session_state.history = []
 
 
 def render_sidebar_status(ok: bool, message: str) -> None:
@@ -229,13 +282,471 @@ def render_result(result: dict) -> None:
                 st.markdown(f"- {p}")
 
 
+def _chat_has_user_messages(sess: dict) -> bool:
+    return any(
+        m.get("role") == "user" and (m.get("content") or "").strip()
+        for m in sess.get("messages") or []
+    )
+
+
+def _discard_empty_chat_session(session_id: str | None) -> bool:
+    """Удаляет из БД диалог, в который пользователь ничего не написал."""
+    if not session_id:
+        return False
+    try:
+        sess = get_chat_session(_backend_base(), session_id)
+        if not _chat_has_user_messages(sess):
+            delete_chat_session(_backend_base(), session_id)
+            return True
+    except requests.RequestException:
+        pass
+    return False
+
+
+def reset_chat_session() -> None:
+    if _discard_empty_chat_session(st.session_state.get("chat_session_id")):
+        reload_menu_from_db()
+    st.session_state.chat_session_id = None
+    st.session_state.chat_messages = []
+    st.session_state.chat_status = None
+    try:
+        save_active_chat(_backend_base(), None)
+    except requests.RequestException:
+        pass
+
+
+def apply_chat_session(sess: dict, *, persist_active: bool = True) -> None:
+    st.session_state.chat_session_id = sess["id"]
+    st.session_state.chat_messages = sess.get("messages") or []
+    st.session_state.chat_status = sess.get("status", "interview")
+    if persist_active:
+        try:
+            save_active_chat(_backend_base(), sess["id"])
+        except requests.RequestException:
+            pass
+
+
+def _format_db_time(iso_value: str | None, fallback: str = "") -> str:
+    if not iso_value:
+        return fallback
+    try:
+        dt = datetime.fromisoformat(iso_value.replace("Z", "+00:00"))
+        return dt.strftime("%d.%m.%Y %H:%M")
+    except ValueError:
+        return (iso_value or fallback)[:16].replace("T", " ")
+
+
+def open_chat_from_db(chat_id: str) -> None:
+    sess = get_chat_session(_backend_base(), chat_id)
+    apply_chat_session(sess)
+    if sess.get("status") == "analyzed" and sess.get("brief"):
+        st.session_state.last_problem = sess["brief"]
+        for hist in st.session_state.history:
+            if hist.get("chat_session_id") == sess["id"]:
+                full = _history_entry_with_result(hist)
+                st.session_state.last_result = full["result"]
+                build_reports(sess["brief"], full["result"])
+                break
+
+
+def open_report_from_db(item: dict) -> None:
+    full = _history_entry_with_result(item)
+    res = full["result"]
+    st.session_state.last_result = res
+    st.session_state.last_problem = full["problem"]
+    build_reports(full["problem"], res)
+    st.session_state.view = "home"
+    chat_id = item.get("chat_session_id")
+    if chat_id:
+        try:
+            sess = get_chat_session(_backend_base(), chat_id)
+            apply_chat_session(sess)
+        except requests.RequestException:
+            pass
+
+
+def restore_active_chat() -> None:
+    """Восстанавливает активный диалог из SQLite после перезагрузки страницы."""
+    if st.session_state.active_chat_restored or st.session_state.chat_session_id:
+        st.session_state.active_chat_restored = True
+        return
+    try:
+        session_id = fetch_active_chat(_backend_base())
+    except requests.RequestException:
+        st.session_state.active_chat_restored = True
+        return
+    if not session_id:
+        st.session_state.active_chat_restored = True
+        return
+    try:
+        sess = get_chat_session(_backend_base(), session_id)
+        if not _chat_has_user_messages(sess):
+            delete_chat_session(_backend_base(), session_id)
+            try:
+                save_active_chat(_backend_base(), None)
+            except requests.RequestException:
+                pass
+        else:
+            apply_chat_session(sess, persist_active=False)
+    except requests.RequestException:
+        try:
+            save_active_chat(_backend_base(), None)
+        except requests.RequestException:
+            pass
+    st.session_state.active_chat_restored = True
+
+
+def bootstrap_from_db() -> None:
+    if reload_menu_from_db():
+        restore_active_chat()
+
+
+def _on_chats_deleted(deleted_ids: list[str]) -> None:
+    """Сбрасывает UI после успешного удаления на backend."""
+    active = st.session_state.chat_session_id
+    if active and active in deleted_ids:
+        reset_chat_session()
+        st.session_state.last_result = None
+        st.session_state.last_problem = ""
+        st.session_state.report_html = None
+        st.session_state.report_docx = None
+    reload_menu_from_db()
+
+
+def _delete_one_chat(chat_id: str) -> None:
+    delete_chat_session(_backend_base(), chat_id)
+    _on_chats_deleted([chat_id])
+
+
+def render_sidebar_menu() -> None:
+    """Левое меню: диалоги и отчёты из базы данных."""
+    ensure_menu_loaded()
+
+    chat_status_labels = {
+        "interview": "сбор",
+        "ready": "готов",
+        "analyzed": "отчёт",
+    }
+
+    col_d1, col_d2, col_d3 = st.columns(
+        [5, 1, 1], gap="small", vertical_alignment="center"
+    )
+    with col_d1:
+        st.markdown(
+            '<span class="sidebar-history-title">Диалоги</span>',
+            unsafe_allow_html=True,
+        )
+    with col_d2:
+        if st.button("↻", help="Обновить меню", key="refresh_menu"):
+            reload_menu_from_db()
+            st.rerun()
+    with col_d3:
+        with st.popover("⋮", help="Действия с диалогами"):
+            if st.session_state.chat_sessions:
+                st.checkbox(
+                    "Подтвердить удаление всех",
+                    key="confirm_delete_all_chats_pop",
+                )
+                if st.button(
+                    "Удалить все диалоги",
+                    key="menu_delete_all_chats",
+                    disabled=not st.session_state.get(
+                        "confirm_delete_all_chats_pop"
+                    ),
+                    use_container_width=True,
+                ):
+                    try:
+                        all_ids = [
+                            c["id"] for c in st.session_state.chat_sessions
+                        ]
+                        delete_all_chat_sessions(_backend_base())
+                        _on_chats_deleted(all_ids)
+                        st.rerun()
+                    except requests.RequestException as exc:
+                        st.error(f"Ошибка: {exc}")
+            else:
+                st.caption("Нет сохранённых диалогов")
+    if not st.session_state.chat_sessions:
+        st.markdown(
+            '<p class="sidebar-empty">Нет диалогов в базе.</p>',
+            unsafe_allow_html=True,
+        )
+    else:
+        for chat_idx, chat_item in enumerate(st.session_state.chat_sessions):
+            chat_id = chat_item["id"]
+            title = (chat_item.get("title") or "Диалог")[:48]
+            status = chat_status_labels.get(
+                chat_item.get("status", ""),
+                chat_item.get("status", ""),
+            )
+            updated = _format_db_time(chat_item.get("updated_at"))
+            is_active = st.session_state.chat_session_id == chat_id
+            btn_label = f"{'▸ ' if is_active else ''}💬 {title}"
+            row_col, menu_col = st.columns(
+                [8, 1], gap="small", vertical_alignment="center"
+            )
+            with row_col:
+                if st.button(
+                    btn_label,
+                    key=f"menu_chat_{chat_idx}",
+                    use_container_width=True,
+                    type="primary" if is_active else "secondary",
+                ):
+                    try:
+                        open_chat_from_db(chat_id)
+                        st.rerun()
+                    except requests.RequestException as exc:
+                        st.error(f"Не удалось открыть: {exc}")
+            with menu_col:
+                if is_active:
+                    with st.popover(
+                        "⋮",
+                        key=f"chat_row_menu_{chat_id}",
+                        help="Меню диалога",
+                    ):
+                        if st.button(
+                            "Удалить диалог",
+                            key=f"chat_row_delete_{chat_id}",
+                            use_container_width=True,
+                        ):
+                            try:
+                                _delete_one_chat(chat_id)
+                                st.rerun()
+                            except requests.RequestException as exc:
+                                st.error(f"Ошибка: {exc}")
+            st.caption(f"{status} · {updated}")
+
+    st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
+
+    col_h1, col_h2 = st.columns([5, 2], gap="small", vertical_alignment="center")
+    with col_h1:
+        st.markdown(
+            '<span class="sidebar-history-title">Отчёты TRIZ</span>',
+            unsafe_allow_html=True,
+        )
+    with col_h2:
+        if st.button("Очистить", disabled=not st.session_state.history, key="clear_history"):
+            try:
+                clear_history()
+                st.session_state.last_result = None
+                st.session_state.last_problem = ""
+                st.session_state.report_html = None
+                st.session_state.report_docx = None
+                st.session_state.view = "home"
+                reload_menu_from_db()
+                st.rerun()
+            except requests.RequestException as exc:
+                st.error(f"Ошибка: {exc}")
+
+    if not st.session_state.history:
+        st.markdown(
+            '<p class="sidebar-empty">Нет отчётов в базе.</p>',
+            unsafe_allow_html=True,
+        )
+    else:
+        for hist_idx, item in enumerate(st.session_state.history):
+            problem_preview = (item.get("problem") or "Отчёт")[:48]
+            time_label = item.get("time") or _format_db_time(item.get("created_at"))
+            source = " · диалог" if item.get("chat_session_id") else ""
+            if st.button(
+                f"📊 {problem_preview}",
+                key=f"menu_report_{hist_idx}",
+                use_container_width=True,
+            ):
+                try:
+                    open_report_from_db(item)
+                    st.rerun()
+                except requests.RequestException as exc:
+                    st.error(f"Не удалось открыть: {exc}")
+            st.caption(f"{time_label}{source}")
+
+
+def ensure_chat_session() -> bool:
+    """Показывает приветствие; в БД сессия создаётся после первого ответа пользователя."""
+    if st.session_state.chat_session_id:
+        return True
+    if not st.session_state.chat_messages:
+        st.session_state.chat_messages = [
+            {"role": "assistant", "content": CHAT_OPENING_MESSAGE},
+        ]
+        st.session_state.chat_status = "interview"
+    return True
+
+
+def ensure_chat_session_in_db() -> bool:
+    """Создаёт запись в БД перед отправкой первого сообщения."""
+    if st.session_state.chat_session_id:
+        return True
+    try:
+        sess = create_chat_session(_backend_base())
+        apply_chat_session(sess)
+        return True
+    except requests.RequestException as exc:
+        st.error(f"Не удалось сохранить диалог: {exc}")
+        return False
+
+
+def render_chat_tab() -> None:
+    """Диалоговое интервью TRIZ."""
+    if not ensure_chat_session():
+        return
+
+    status = st.session_state.chat_status or "interview"
+    status_labels = {
+        "interview": "Сбор данных",
+        "ready": "Готово к анализу",
+        "analyzed": "Анализ выполнен",
+    }
+    st.caption(f"Этап: **{status_labels.get(status, status)}**")
+
+    for msg in st.session_state.chat_messages:
+        role = msg.get("role", "assistant")
+        with st.chat_message("user" if role == "user" else "assistant"):
+            st.markdown(msg.get("content", ""))
+
+    if status == "ready":
+        st.success(
+            "Интервью завершено. Запустите экспертный TRIZ-анализ — формирование отчёта "
+            "займёт 1–3 минуты."
+        )
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button(
+                "Запустить TRIZ-анализ",
+                type="primary",
+                use_container_width=True,
+                key="chat_analyze",
+            ):
+                with st.spinner("Выполняю экспертный TRIZ-анализ…"):
+                    try:
+                        payload = analyze_chat_session(
+                            _backend_base(),
+                            st.session_state.chat_session_id,
+                        )
+                        result = payload.get("result") or payload
+                        brief = payload.get("brief", "")
+                        st.session_state.last_result = result
+                        st.session_state.last_problem = brief
+                        st.session_state.chat_status = "analyzed"
+                        build_reports(brief, result)
+                        reload_menu_from_db()
+                        st.rerun()
+                    except requests.Timeout:
+                        st.error("Превышено время ожидания анализа.")
+                    except requests.HTTPError as exc:
+                        st.error(f"Ошибка анализа: {exc}")
+                    except requests.RequestException as exc:
+                        st.error(f"Ошибка запроса: {exc}")
+        with col_b:
+            if st.button(
+                "Новый диалог",
+                use_container_width=True,
+                key="chat_new_after_ready",
+            ):
+                reset_chat_session()
+                st.rerun()
+        return
+
+    if status == "analyzed":
+        st.info("По этой сессии анализ уже выполнен. Отчёт ниже или начните новый диалог.")
+        return
+
+    action_col1, action_col2 = st.columns(2)
+    with action_col2:
+        if st.button(
+            "Завершить интервью вручную",
+            help="Если все блоки пройдены, но кнопка анализа не появилась",
+            key="chat_complete_manual",
+            disabled=not st.session_state.chat_session_id,
+        ):
+            try:
+                sess = complete_chat_session(
+                    _backend_base(),
+                    st.session_state.chat_session_id,
+                )
+                apply_chat_session(sess)
+                reload_menu_from_db()
+                st.rerun()
+            except requests.RequestException as exc:
+                st.error(f"Ошибка: {exc}")
+
+    prompt = st.chat_input("Ваш ответ…")
+    if prompt:
+        with st.spinner("Аналитик формулирует следующий вопрос…"):
+            try:
+                if not ensure_chat_session_in_db():
+                    return
+                sess = send_chat_message(
+                    _backend_base(),
+                    st.session_state.chat_session_id,
+                    prompt.strip(),
+                )
+                apply_chat_session(sess)
+                reload_menu_from_db()
+                st.rerun()
+            except requests.Timeout:
+                st.error("Превышено время ожидания ответа модели.")
+            except requests.HTTPError as exc:
+                st.error(f"Ошибка: {exc}")
+            except requests.RequestException as exc:
+                st.error(f"Ошибка запроса: {exc}")
+
+
+def render_quick_solve_tab() -> None:
+    """Одноразовый анализ без интервью (бриф целиком)."""
+    st.markdown("**Опишите задачу целиком** (шаблон или сводка)")
+    problem = st.text_area(
+        "Опишите вашу задачу",
+        height=140,
+        placeholder="Например: нужно снизить энергопотребление двигателя без потери мощности...",
+        label_visibility="collapsed",
+        max_chars=MAX_PROBLEM_LENGTH,
+        key="problem_input",
+    )
+    st.caption(f"{len(problem)} / {MAX_PROBLEM_LENGTH} символов")
+
+    if st.button("Решить задачу", type="primary", use_container_width=True, key="quick_solve"):
+        problem_text = problem.strip()
+        if not problem_text:
+            st.warning("Введите описание задачи.", icon="✏️")
+        elif len(problem_text) < MIN_PROBLEM_LENGTH:
+            st.warning(
+                f"Задача слишком короткая — минимум {MIN_PROBLEM_LENGTH} символа.",
+                icon="✏️",
+            )
+        else:
+            with st.spinner("Выполняю экспертный TRIZ-анализ и формирую отчёт…"):
+                try:
+                    result = call_solve_api(problem_text)
+                    reload_menu_from_db()
+                    st.session_state.last_result = result
+                    st.session_state.last_problem = problem_text
+                    build_reports(problem_text, result)
+                    st.rerun()
+                except requests.ConnectionError:
+                    st.error(
+                        "Не удалось подключиться к backend. "
+                        f"Проверьте `{_backend_base()}{SOLVE_ENDPOINT}`.",
+                        icon="🔌",
+                    )
+                except requests.Timeout:
+                    st.error("Backend не ответил вовремя.", icon="⏱️")
+                except requests.HTTPError as exc:
+                    code = exc.response.status_code if exc.response else "?"
+                    st.error(f"Ошибка API ({code}): {exc}", icon="⚠️")
+                except requests.RequestException as exc:
+                    st.error(f"Ошибка запроса: {exc}", icon="⚠️")
+
+
+bootstrap_from_db()
+
 # --- Sidebar ---
 with st.sidebar:
     st.markdown(
         """
         <div class="sidebar-brand">
             <div class="sidebar-brand-title">AI-Ассистент</div>
-            <div class="sidebar-brand-sub">Настройки и история</div>
+            <div class="sidebar-brand-sub">Меню из базы данных</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -247,44 +758,30 @@ with st.sidebar:
         help="Адрес FastAPI-сервера (по умолчанию localhost:8000)",
     )
 
+    if st.session_state.get("db_menu_error"):
+        st.caption(st.session_state.db_menu_error)
+
     healthy, health_message = check_backend_health()
     render_sidebar_status(healthy, health_message)
 
+    if st.button("Новый диалог", use_container_width=True, key="sidebar_new_chat"):
+        reset_chat_session()
+        st.session_state.last_result = None
+        st.session_state.last_problem = ""
+        st.session_state.report_html = None
+        st.session_state.report_docx = None
+        reload_menu_from_db()
+        st.rerun()
+
     st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
+    render_sidebar_menu()
 
-    col_h1, col_h2 = st.columns([5, 2], gap="small", vertical_alignment="center")
-    with col_h1:
-        st.markdown('<span class="sidebar-history-title">История</span>', unsafe_allow_html=True)
-    with col_h2:
-        if st.button("Очистить", disabled=not st.session_state.history, key="clear_history"):
-            st.session_state.history = []
-            st.session_state.last_result = None
-            st.session_state.last_problem = ""
-            st.session_state.report_html = None
-            st.session_state.report_docx = None
-            st.session_state.view = "home"
-            st.rerun()
+# Просмотр отчёта (сайдбар остаётся доступным)
+if st.session_state.view == "report":
+    from report_view import render_report_page
 
-    if not st.session_state.history:
-        st.markdown(
-            '<p class="sidebar-empty">Пока нет запросов — решите первую задачу.</p>',
-            unsafe_allow_html=True,
-        )
-    else:
-        for hist_idx, item in enumerate(st.session_state.history):
-            with st.expander(f"🕐 {item['time']}", expanded=False):
-                st.markdown(f"**Задача:** {item['problem']}")
-                res = item["result"]
-                st.markdown(f"**Противоречие:** {res.get('contradiction', '—')}")
-                n_principles = len(res.get("recommended_principles", []))
-                n_solutions = len(res.get("solution_concepts") or res.get("solutions", []))
-                st.markdown(f"**Принципов:** {n_principles} · **Решений:** {n_solutions}")
-                if st.button("Показать снова", key=f"hist_show_{hist_idx}"):
-                    st.session_state.last_result = res
-                    st.session_state.last_problem = item["problem"]
-                    build_reports(item["problem"], res)
-                    st.session_state.view = "home"
-                    st.rerun()
+    render_report_page(show_back=True)
+    st.stop()
 
 # --- Main page ---
 st.markdown(
@@ -292,63 +789,20 @@ st.markdown(
     <div class="triz-hero">
         <span class="triz-badge">Теория решения изобретательских задач</span>
         <h1>TRIZ AI-Ассистент</h1>
-        <p>Экспертный TRIZ-анализ: противоречия, инструменты, ранжированные решения
+        <p>Диалоговый сбор исходных данных, затем экспертный TRIZ-анализ
         и отчёт для руководства (HTML / DOCX).</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-st.markdown("**Опишите вашу задачу**")
-problem = st.text_area(
-    "Опишите вашу задачу",
-    height=140,
-    placeholder="Например: нужно снизить энергопотребление двигателя без потери мощности...",
-    label_visibility="collapsed",
-    max_chars=MAX_PROBLEM_LENGTH,
-    key="problem_input",
-)
+tab_dialog, tab_quick = st.tabs(["Диалог с аналитиком", "Быстрый анализ"])
 
-char_count = len(problem)
-st.caption(f"{char_count} / {MAX_PROBLEM_LENGTH} символов")
+with tab_dialog:
+    render_chat_tab()
 
-solve_clicked = st.button("Решить задачу", type="primary", use_container_width=True)
-
-if solve_clicked:
-    problem_text = problem.strip()
-    if not problem_text:
-        st.warning("Введите описание задачи.", icon="✏️")
-    elif len(problem_text) < MIN_PROBLEM_LENGTH:
-        st.warning(
-            f"Задача слишком короткая — минимум {MIN_PROBLEM_LENGTH} символа.",
-            icon="✏️",
-        )
-    else:
-        with st.spinner("Выполняю экспертный TRIZ-анализ и формирую отчёт…"):
-            try:
-                result = call_solve_api(problem_text)
-                add_to_history(problem_text, result)
-                st.session_state.last_result = result
-                st.session_state.last_problem = problem_text
-                build_reports(problem_text, result)
-            except requests.ConnectionError:
-                st.error(
-                    "Не удалось подключиться к backend. "
-                    f"Проверьте `{_backend_base()}{SOLVE_ENDPOINT}` "
-                    "и что сервер запущен.",
-                    icon="🔌",
-                )
-            except requests.Timeout:
-                st.error(
-                    "Backend не ответил вовремя. "
-                    "Упростите формулировку или повторите позже.",
-                    icon="⏱️",
-                )
-            except requests.HTTPError as exc:
-                code = exc.response.status_code if exc.response else "?"
-                st.error(f"Ошибка API ({code}): {exc}", icon="⚠️")
-            except requests.RequestException as exc:
-                st.error(f"Ошибка запроса: {exc}", icon="⚠️")
+with tab_quick:
+    render_quick_solve_tab()
 
 if st.session_state.last_result:
     st.divider()
