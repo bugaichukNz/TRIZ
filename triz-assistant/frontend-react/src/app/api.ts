@@ -119,16 +119,37 @@ export const trizApi = createApi({
       }),
       async onQueryStarted({ sessionId, content }, { dispatch, queryFulfilled }) {
         const trimmed = content.trim()
-        const patch = dispatch(
-          trizApi.util.updateQueryData('getChatSession', sessionId, (draft) => {
-            draft.messages.push({ role: 'user', content: trimmed })
-          }),
-        )
+        let patch: { undo: () => void } | undefined
+        // Optimistic UI: сразу добавляем пользовательское сообщение в кеш.
+        // Если кеш ещё не инициализирован (редко, но бывает при быстрой навигации),
+        // то просто пропускаем оптимизм.
         try {
-          const { data } = await queryFulfilled
-          dispatch(trizApi.util.upsertQueryData('getChatSession', sessionId, data))
+          patch = dispatch(
+            trizApi.util.updateQueryData('getChatSession', sessionId, (draft) => {
+              draft.messages.push({ role: 'user', content: trimmed })
+            }),
+          )
         } catch {
-          patch.undo()
+          /* no cache yet */
+        }
+        try {
+          // В теле ответа сервер возвращает обновлённую сессию целиком:
+          // включая ответ аналитика в `messages`.
+          const { data: freshSession } = await queryFulfilled
+
+          // Обновляем кеш живого запроса так, чтобы UI мгновенно отрендерил fresh `messages`.
+          try {
+            dispatch(
+              trizApi.util.updateQueryData('getChatSession', sessionId, (draft) => {
+                Object.assign(draft, freshSession)
+              }),
+            )
+          } catch {
+            // Если кеш ещё не был подписан/инициализирован — используем upsert.
+            dispatch(trizApi.util.upsertQueryData('getChatSession', sessionId, freshSession))
+          }
+        } catch {
+          patch?.undo()
         }
       },
       invalidatesTags: [{ type: 'ChatSessionList', id: 'LIST' }],
