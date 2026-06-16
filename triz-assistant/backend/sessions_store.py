@@ -20,6 +20,7 @@ LEGACY_JSON_PATH = PROJECT_ROOT / "data" / "sessions" / "history.json"
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS history_entries (
     id TEXT PRIMARY KEY,
+    user_id TEXT,
     problem TEXT NOT NULL,
     result_json TEXT NOT NULL,
     time_display TEXT NOT NULL,
@@ -93,6 +94,7 @@ class SessionsStore:
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
         conn.executescript(_SCHEMA)
         self._migrate_schema(conn)
+        self._assign_orphan_user_ids(conn)
 
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(history_entries)")}
@@ -100,6 +102,28 @@ class SessionsStore:
             conn.execute(
                 "ALTER TABLE history_entries ADD COLUMN chat_session_id TEXT"
             )
+        if cols and "user_id" not in cols:
+            conn.execute("ALTER TABLE history_entries ADD COLUMN user_id TEXT")
+            self._assign_orphan_user_ids(conn)
+
+    def _assign_orphan_user_ids(self, conn: sqlite3.Connection) -> None:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if "users" not in tables:
+            return
+        row = conn.execute(
+            "SELECT id FROM users ORDER BY created_at LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return
+        conn.execute(
+            "UPDATE history_entries SET user_id = ? WHERE user_id IS NULL",
+            (row["id"],),
+        )
 
     def _init_once(self) -> None:
         if self._initialized:
@@ -159,6 +183,7 @@ class SessionsStore:
 
     def list_entries(
         self,
+        user_id: str,
         limit: int | None = None,
         *,
         summary: bool = False,
@@ -171,10 +196,11 @@ class SessionsStore:
                     """
                     SELECT id, problem, time_display, created_at, chat_session_id
                     FROM history_entries
+                    WHERE user_id = ?
                     ORDER BY created_at DESC
                     LIMIT ?
                     """,
-                    (cap,),
+                    (user_id, cap),
                 ).fetchall()
                 return [
                     {
@@ -190,38 +216,80 @@ class SessionsStore:
                 """
                 SELECT id, problem, result_json, time_display, created_at, chat_session_id
                 FROM history_entries
+                WHERE user_id = ?
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
-                (cap,),
+                (user_id, cap),
             ).fetchall()
         return [_row_to_entry(row) for row in rows]
 
-    def get_entry(self, entry_id: str) -> dict[str, Any] | None:
+    def get_entry(self, entry_id: str, *, user_id: str | None = None) -> dict[str, Any] | None:
+        self._init_once()
+        with self._connect() as conn:
+            if user_id is not None:
+                row = conn.execute(
+                    """
+                    SELECT id, problem, result_json, time_display, created_at, chat_session_id
+                    FROM history_entries
+                    WHERE id = ? AND user_id = ?
+                    """,
+                    (entry_id, user_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT id, problem, result_json, time_display, created_at, chat_session_id
+                    FROM history_entries
+                    WHERE id = ?
+                    """,
+                    (entry_id,),
+                ).fetchone()
+        if row is None:
+            return None
+        return _row_to_entry(row)
+
+    def get_entry_by_chat_session(
+        self, chat_session_id: str, user_id: str
+    ) -> dict[str, Any] | None:
         self._init_once()
         with self._connect() as conn:
             row = conn.execute(
                 """
                 SELECT id, problem, result_json, time_display, created_at, chat_session_id
                 FROM history_entries
-                WHERE id = ?
+                WHERE chat_session_id = ? AND user_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
                 """,
-                (entry_id,),
+                (chat_session_id, user_id),
             ).fetchone()
         if row is None:
             return None
         return _row_to_entry(row)
 
-    def delete_entries_for_chat_sessions(self, session_ids: list[str]) -> int:
+    def delete_entries_for_chat_sessions(
+        self, session_ids: list[str], user_id: str | None = None
+    ) -> int:
         if not session_ids:
             return 0
         self._init_once()
         placeholders = ",".join("?" * len(session_ids))
         with self._connect() as conn:
-            cur = conn.execute(
-                f"DELETE FROM history_entries WHERE chat_session_id IN ({placeholders})",
-                session_ids,
-            )
+            if user_id is not None:
+                params = [user_id, *session_ids]
+                cur = conn.execute(
+                    f"""
+                    DELETE FROM history_entries
+                    WHERE user_id = ? AND chat_session_id IN ({placeholders})
+                    """,
+                    params,
+                )
+            else:
+                cur = conn.execute(
+                    f"DELETE FROM history_entries WHERE chat_session_id IN ({placeholders})",
+                    session_ids,
+                )
             conn.commit()
             return cur.rowcount
 
@@ -232,6 +300,7 @@ class SessionsStore:
         *,
         time_display: str | None = None,
         chat_session_id: str | None = None,
+        user_id: str | None = None,
     ) -> dict[str, Any]:
         self._init_once()
         entry = {
@@ -246,11 +315,12 @@ class SessionsStore:
             conn.execute(
                 """
                 INSERT INTO history_entries
-                    (id, problem, result_json, time_display, created_at, chat_session_id)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (id, user_id, problem, result_json, time_display, created_at, chat_session_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     entry["id"],
+                    user_id,
                     entry["problem"],
                     json.dumps(entry["result"], ensure_ascii=False),
                     entry["time"],
@@ -311,13 +381,15 @@ class SessionsStore:
                 )
             conn.commit()
 
-    def clear(self) -> None:
+    def clear(self, user_id: str | None = None) -> None:
         self._init_once()
         with self._connect() as conn:
-            conn.execute("DELETE FROM history_entries")
-            conn.execute(
-                "DELETE FROM app_state WHERE key = ?",
-                (ACTIVE_CHAT_SESSION_KEY,),
-            )
+            if user_id is not None:
+                conn.execute(
+                    "DELETE FROM history_entries WHERE user_id = ?",
+                    (user_id,),
+                )
+            else:
+                conn.execute("DELETE FROM history_entries")
             conn.commit()
         logger.info("История очищена в БД: %s", self.db_path)

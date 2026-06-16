@@ -23,6 +23,7 @@ STATUS_ANALYZED = "analyzed"
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS chat_sessions (
     id TEXT PRIMARY KEY,
+    user_id TEXT,
     status TEXT NOT NULL DEFAULT 'interview',
     title TEXT,
     messages_json TEXT NOT NULL,
@@ -80,6 +81,39 @@ class ChatStore:
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
         conn.executescript(_SCHEMA)
+        self._migrate_schema(conn)
+        self._assign_orphan_user_ids(conn, "chat_sessions")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_chat_sessions_user
+                ON chat_sessions (user_id, updated_at DESC)
+            """
+        )
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(chat_sessions)")}
+        if cols and "user_id" not in cols:
+            conn.execute("ALTER TABLE chat_sessions ADD COLUMN user_id TEXT")
+            self._assign_orphan_user_ids(conn, "chat_sessions")
+
+    def _assign_orphan_user_ids(self, conn: sqlite3.Connection, table: str) -> None:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if "users" not in tables:
+            return
+        row = conn.execute(
+            "SELECT id FROM users ORDER BY created_at LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return
+        conn.execute(
+            f"UPDATE {table} SET user_id = ? WHERE user_id IS NULL",
+            (row["id"],),
+        )
 
     def _row_to_session(self, row: sqlite3.Row) -> dict[str, Any]:
         messages = json.loads(row["messages_json"])
@@ -106,33 +140,70 @@ class ChatStore:
             (self.max_sessions,),
         )
 
-    def _purge_empty_sessions(self, conn: sqlite3.Connection) -> None:
-        """Удаляет черновики без ответа пользователя (только приветствие ассистента)."""
-        conn.execute(
-            """
-            DELETE FROM chat_sessions
-            WHERE title IS NULL AND status = ?
-            """,
-            (STATUS_INTERVIEW,),
-        )
+    def _purge_empty_sessions(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        keep_session_id: str | None = None,
+        user_id: str | None = None,
+    ) -> None:
+        """Удаляет черновики без ответа пользователя, кроме активной сессии."""
+        if user_id and keep_session_id:
+            conn.execute(
+                """
+                DELETE FROM chat_sessions
+                WHERE user_id = ? AND title IS NULL AND status = ? AND id != ?
+                """,
+                (user_id, STATUS_INTERVIEW, keep_session_id),
+            )
+        elif user_id:
+            conn.execute(
+                """
+                DELETE FROM chat_sessions
+                WHERE user_id = ? AND title IS NULL AND status = ?
+                """,
+                (user_id, STATUS_INTERVIEW),
+            )
+        elif keep_session_id:
+            conn.execute(
+                """
+                DELETE FROM chat_sessions
+                WHERE title IS NULL AND status = ? AND id != ?
+                """,
+                (STATUS_INTERVIEW, keep_session_id),
+            )
+        else:
+            conn.execute(
+                """
+                DELETE FROM chat_sessions
+                WHERE title IS NULL AND status = ?
+                """,
+                (STATUS_INTERVIEW,),
+            )
 
-    def list_sessions(self, limit: int | None = None) -> list[dict[str, Any]]:
+    def list_sessions(
+        self,
+        user_id: str,
+        limit: int | None = None,
+        *,
+        keep_session_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Краткий список без разбора messages_json (быстрая загрузка меню)."""
         cap = limit if limit is not None else self.max_sessions
         with self._connect() as conn:
             self._ensure_schema(conn)
-            self._purge_empty_sessions(conn)
+            self._purge_empty_sessions(conn, keep_session_id=keep_session_id, user_id=user_id)
             conn.commit()
             rows = conn.execute(
                 """
                 SELECT id, status, title, created_at, updated_at
                 FROM chat_sessions
-                WHERE title IS NOT NULL
-                   OR status IN (?, ?)
+                WHERE user_id = ?
+                  AND (title IS NOT NULL OR status IN (?, ?))
                 ORDER BY updated_at DESC
                 LIMIT ?
                 """,
-                (STATUS_READY, STATUS_ANALYZED, cap),
+                (user_id, STATUS_READY, STATUS_ANALYZED, cap),
             ).fetchall()
         return [
             {
@@ -147,37 +218,41 @@ class ChatStore:
             for row in rows
         ]
 
-    def delete_session(self, session_id: str) -> bool:
+    def delete_session(self, session_id: str, user_id: str) -> bool:
         with self._connect() as conn:
             self._ensure_schema(conn)
             cur = conn.execute(
-                "DELETE FROM chat_sessions WHERE id = ?",
-                (session_id,),
+                "DELETE FROM chat_sessions WHERE id = ? AND user_id = ?",
+                (session_id, user_id),
             )
             conn.commit()
             return cur.rowcount > 0
 
-    def delete_sessions(self, session_ids: list[str]) -> int:
+    def delete_sessions(self, session_ids: list[str], user_id: str) -> int:
         if not session_ids:
             return 0
         placeholders = ",".join("?" * len(session_ids))
+        params = [user_id, *session_ids]
         with self._connect() as conn:
             self._ensure_schema(conn)
             cur = conn.execute(
-                f"DELETE FROM chat_sessions WHERE id IN ({placeholders})",
-                session_ids,
+                f"DELETE FROM chat_sessions WHERE user_id = ? AND id IN ({placeholders})",
+                params,
             )
             conn.commit()
             return cur.rowcount
 
-    def delete_all_sessions(self) -> int:
+    def delete_all_sessions(self, user_id: str) -> int:
         with self._connect() as conn:
             self._ensure_schema(conn)
-            cur = conn.execute("DELETE FROM chat_sessions")
+            cur = conn.execute(
+                "DELETE FROM chat_sessions WHERE user_id = ?",
+                (user_id,),
+            )
             conn.commit()
             return cur.rowcount
 
-    def create_session(self) -> dict[str, Any]:
+    def create_session(self, user_id: str) -> dict[str, Any]:
         session_id = str(uuid.uuid4())
         now = _now_iso()
         messages = [
@@ -188,13 +263,14 @@ class ChatStore:
             conn.execute(
                 """
                 INSERT INTO chat_sessions
-                    (id, status, title, messages_json, brief, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (id, user_id, status, title, messages_json, brief, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
+                    user_id,
                     STATUS_INTERVIEW,
-                    None,
+                    "Новый диалог",
                     json.dumps(messages, ensure_ascii=False),
                     None,
                     now,
@@ -203,15 +279,21 @@ class ChatStore:
             )
             self._trim_sessions(conn)
             conn.commit()
-        return self.get_session(session_id)
+        return self.get_session(session_id, user_id=user_id)
 
-    def get_session(self, session_id: str) -> dict[str, Any] | None:
+    def get_session(self, session_id: str, *, user_id: str | None = None) -> dict[str, Any] | None:
         with self._connect() as conn:
             self._ensure_schema(conn)
-            row = conn.execute(
-                "SELECT * FROM chat_sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
+            if user_id is not None:
+                row = conn.execute(
+                    "SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?",
+                    (session_id, user_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM chat_sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
         if row is None:
             return None
         return self._row_to_session(row)

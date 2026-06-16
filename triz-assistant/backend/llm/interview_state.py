@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -10,6 +11,20 @@ _STATE_ROLE = "system"
 _STATE_PREFIX = "__interview_state__:"
 _CONTEXT_PREFIX = "[КОНТЕКСТ:"
 _DIALOG_TAIL = 6
+_SKIPPED_VALUE = "—"
+_MAX_FIELD_ATTEMPTS = 2
+
+_RETRY_HINTS: dict[str, str] = {
+    "ne_when": (
+        "Предыдущий ответ отклонён (тавтология). Переспроси с уточнением: "
+        "«Вы назвали процесс, а нужны конкретные условия: температура, режим, тип шва»."
+    ),
+}
+
+_TIME_ONLY = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?\s*$")
+_DATETIME_ONLY = re.compile(
+    r"^\d{1,2}\.\d{1,2}\.\d{4}\s+\d{1,2}:\d{2}(:\d{2})?\s*$"
+)
 
 BLOCKS: list[tuple[str, list[str]]] = [
     ("1 — НЭ", ["ne_fact", "ne_where", "ne_when", "consequences", "cause_hypothesis"]),
@@ -79,6 +94,7 @@ class InterviewStateManager:
             "confirmed": {},
             "pending_field": None,
             "asked": [],
+            "attempts": {},
         }
 
     @staticmethod
@@ -96,21 +112,26 @@ class InterviewStateManager:
         )
 
     def _load(self, messages: list[dict[str, str]]) -> tuple[dict[str, Any], int]:
+        state = self._empty_state()
+        state_index = -1
         for i, msg in enumerate(messages):
             if self._is_state_message(msg):
                 try:
                     raw = msg["content"][len(_STATE_PREFIX) :]
-                    state = json.loads(raw)
-                    if "pending_field" not in state:
-                        state["pending_field"] = None
-                    if "asked" not in state:
-                        state["asked"] = []
-                    if "confirmed" not in state:
-                        state["confirmed"] = {}
-                    return state, i
+                    parsed = json.loads(raw)
+                    if "pending_field" not in parsed:
+                        parsed["pending_field"] = None
+                    if "asked" not in parsed:
+                        parsed["asked"] = []
+                    if "confirmed" not in parsed:
+                        parsed["confirmed"] = {}
+                    if "attempts" not in parsed:
+                        parsed["attempts"] = {}
+                    state = parsed
+                    state_index = i
                 except Exception:
                     pass
-        return self._empty_state(), -1
+        return state, state_index
 
     def _serialize(self) -> str:
         return _STATE_PREFIX + json.dumps(self._state, ensure_ascii=False)
@@ -125,6 +146,10 @@ class InterviewStateManager:
     def pending_field(self) -> str | None:
         return self._state.get("pending_field")
 
+    @property
+    def confirmed(self) -> dict[str, str]:
+        return dict(self._state.get("confirmed", {}))
+
     def set_pending_field(self, field: str | None) -> None:
         self._state["pending_field"] = field
 
@@ -138,31 +163,126 @@ class InterviewStateManager:
         self._state["confirmed"][field] = value.strip()
         if field not in self._state["asked"]:
             self._state["asked"].append(field)
+        self._state.setdefault("attempts", {}).pop(field, None)
         logger.debug("Подтверждено поле (manual): %s", field)
 
     def mark_asked(self, field: str) -> None:
         if field not in self._state["asked"]:
             self._state["asked"].append(field)
 
+    @staticmethod
+    def _normalize_line(line: str) -> str:
+        return " ".join(line.strip().split()).lower()
+
+    @classmethod
+    def _last_assistant_prompt(cls, messages: list[dict[str, str]]) -> str:
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant" and not cls._is_context_message(msg):
+                content = (msg.get("content") or "").strip()
+                if content:
+                    return content
+        return ""
+
+    @classmethod
+    def sanitize_user_answer(
+        cls,
+        raw: str,
+        messages: list[dict[str, str]] | None = None,
+    ) -> str:
+        """
+        Убирает артефакты UI из ответа пользователя.
+
+        Удаляются только:
+        - строки, целиком являющиеся таймстемпом UI (15:37, 01.06.2026 15:37);
+        - строки, полностью совпадающие с текстом последнего вопроса ассистента;
+        - префикс, если ответ начинается с полного текста вопроса (копипаст).
+
+        Соотношения (9:1, 12:1), числа и время внутри предложения НЕ трогаем.
+        """
+        text = (raw or "").strip()
+        if not text:
+            return ""
+
+        assistant = cls._last_assistant_prompt(messages or []) if messages else ""
+        assistant_lines: set[str] = set()
+        if assistant:
+            assistant_lines.add(cls._normalize_line(assistant))
+            for line in assistant.splitlines():
+                norm = cls._normalize_line(line)
+                if len(norm) >= 12:
+                    assistant_lines.add(norm)
+
+        kept: list[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if _TIME_ONLY.match(stripped) or _DATETIME_ONLY.match(stripped):
+                continue
+            if cls._normalize_line(stripped) in assistant_lines:
+                continue
+            kept.append(stripped)
+
+        result = "\n".join(kept).strip()
+        if assistant and result.startswith(assistant):
+            result = result[len(assistant) :].strip()
+        elif assistant:
+            a_norm = cls._normalize_line(assistant)
+            r_norm = cls._normalize_line(result)
+            if r_norm == a_norm:
+                result = ""
+
+        return result.strip()
+
+    def _skip_stale_field(self, field: str) -> None:
+        """Поле исчерпало лимит попыток — закрываем пропуском, чтобы не зациклиться."""
+        self._state["confirmed"][field] = _SKIPPED_VALUE
+        if field not in self._state["asked"]:
+            self._state["asked"].append(field)
+        self._state.setdefault("attempts", {}).pop(field, None)
+        logger.info(
+            "Поле %s пропущено после %d неудачных попыток",
+            field,
+            _MAX_FIELD_ATTEMPTS,
+        )
+
+    def _field_attempts(self, field: str) -> int:
+        return int(self._state.get("attempts", {}).get(field, 0))
+
+    def _bump_attempt(self, field: str) -> None:
+        attempts = self._state.setdefault("attempts", {})
+        attempts[field] = attempts.get(field, 0) + 1
+        logger.debug(
+            "Неудачная попытка для %s: %d/%d",
+            field,
+            attempts[field],
+            _MAX_FIELD_ATTEMPTS,
+        )
+
     def confirm_pending_answer(
         self,
         answer: str,
         *,
         reject_field: Callable[[str, str], bool] | None = None,
+        messages: list[dict[str, str]] | None = None,
     ) -> None:
         """Подтверждает ответ пользователя на поле pending_field."""
-        text = (answer or "").strip()
-        if not text:
-            return
-
+        text = self.sanitize_user_answer(answer, messages)
         field = self._state.get("pending_field")
 
         if not field or field in self._state["confirmed"]:
             self._state["pending_field"] = None
             return
 
+        if not text:
+            logger.debug("Пустой ответ после очистки для %s", field)
+            self._bump_attempt(field)
+            self._state["pending_field"] = None
+            return
+
         if reject_field and reject_field(field, text):
             logger.debug("Ответ на %s отклонён валидатором", field)
+            self._bump_attempt(field)
             self._state["pending_field"] = None
             return
 
@@ -172,15 +292,33 @@ class InterviewStateManager:
     def prepare_next_pending(self) -> None:
         """Выставляет pending_field на поле следующего вопроса (до вызова LLM)."""
         nxt = self.next_field_to_ask()
-        self._state["pending_field"] = nxt[0] if nxt else None
-        if nxt:
-            self.mark_asked(nxt[0])
+        if not nxt:
+            self._state["pending_field"] = None
+            return
+
+        field = nxt[0]
+        if field in self._state["asked"] and field not in self._state["confirmed"]:
+            if self._field_attempts(field) >= _MAX_FIELD_ATTEMPTS:
+                self._skip_stale_field(field)
+                nxt = self.next_field_to_ask()
+                if not nxt:
+                    self._state["pending_field"] = None
+                    return
+                field = nxt[0]
+            else:
+                self._state["pending_field"] = field
+                return
+
+        self._state["pending_field"] = field
+        self.mark_asked(field)
 
     @staticmethod
     def last_user_message(messages: list[dict[str, str]]) -> str:
         for msg in reversed(messages):
             if msg.get("role") == "user":
-                return (msg.get("content") or "").strip()
+                raw = (msg.get("content") or "").strip()
+                if raw:
+                    return InterviewStateManager.sanitize_user_answer(raw, messages)
         return ""
 
     def get_status(self) -> list[dict[str, Any]]:
@@ -239,13 +377,28 @@ class InterviewStateManager:
                 lines.append(f"• {block['block']}: НЕ ЗАКРЫТ — ожидаются: {missing_str}")
 
         lines.append("")
+        pending = self._state.get("pending_field")
+        attempts = self._state.get("attempts", {})
         if next_field:
-            _, field_label = next_field
-            lines.append(
-                f"[ИНСТРУКЦИЯ: следующее поле для вопроса — «{field_label}». "
-                f"Задай ОДИН конкретный вопрос именно по нему. "
-                f"Не переходи к другим полям.]"
-            )
+            field_key, field_label = next_field
+            if (
+                pending == field_key
+                and field_key not in confirmed
+                and attempts.get(field_key, 0) >= 1
+            ):
+                retry_hint = _RETRY_HINTS.get(
+                    field_key,
+                    "Задай уточняющий переспрос по тому же полю.",
+                )
+                lines.append(
+                    f"[ИНСТРУКЦИЯ: переспрос поля «{field_label}». {retry_hint}]"
+                )
+            else:
+                lines.append(
+                    f"[ИНСТРУКЦИЯ: следующее поле для вопроса — «{field_label}». "
+                    f"Задай ОДИН конкретный вопрос именно по нему. "
+                    f"Не переходи к другим полям.]"
+                )
         elif self.is_complete():
             lines.append(
                 "[ИНСТРУКЦИЯ: все блоки 0–5 закрыты. "
