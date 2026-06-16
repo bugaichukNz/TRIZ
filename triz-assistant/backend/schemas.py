@@ -68,6 +68,10 @@ class SolveResponse(BaseModel):
 
     ideal_final_result: str
 
+    root_cause: str = Field(
+        description="Корневое физическое/химическое явление по ПСА"
+    )
+
     analysis: AnalysisBlock
 
     triz_tools: list[TrizToolRow]
@@ -308,5 +312,50 @@ class ChatAnalyzeResponse(BaseModel):
     brief: str
 
     result: SolveResponse
+
+
+class ChatAnalyzeRequest(BaseModel):
+
+    """Запуск анализа; force=true — принудительно завершить интервью."""
+
+    force: bool = False
+
+
+class AnalyzeProgressResponse(BaseModel):
+
+    """Прогресс формирования TRIZ-отчёта."""
+
+    session_id: str
+
+    progress: int = Field(ge=0, le=100)
+
+    stage: str
+
+    status: str = Field(description="idle | running | completed | failed")
+
+    error: str | None = None
+
+
+class LoginRequest(BaseModel):
+
+    username: str = Field(..., min_length=1, max_length=64)
+
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class UserInfo(BaseModel):
+
+    id: str
+
+    username: str
+
+
+class LoginResponse(BaseModel):
+
+    access_token: str
+
+    token_type: str = "bearer"
+
+    user: UserInfo
 
 

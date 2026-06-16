@@ -32,13 +32,15 @@ class Settings(BaseSettings):
 
     openai_proxy_url: str = ""
 
-    llm_model: str = "gpt-4o-mini"
+    llm_model: str = "gpt-4o"
 
     database_url: str = "sqlite:///data/sessions/triz.db"
 
     history_max_entries: int = 20
 
     chat_sessions_max: int = 50
+
+    jwt_secret: str = "triz-dev-secret-change-in-production"
 
 
 

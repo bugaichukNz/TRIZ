@@ -14,10 +14,10 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 
 from fastapi.middleware.cors import CORSMiddleware
 
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
-
-
+from backend.analysis_progress import analysis_progress
+from backend.auth import CurrentUser, create_access_token, get_user_store
 from backend.config import settings
 
 from backend.chat_service import ChatService, ChatServiceError
@@ -27,6 +27,8 @@ from backend.llm.chain import TRIZChain, TRIZChainError
 from backend.schemas import (
     ActiveChatStateResponse,
     ActiveChatStateUpdate,
+    AnalyzeProgressResponse,
+    ChatAnalyzeRequest,
     ChatAnalyzeResponse,
     ChatMessage,
     ChatMessageRequest,
@@ -39,12 +41,17 @@ from backend.schemas import (
     HealthResponse,
     HistoryEntry,
     HistoryEntryCreate,
+    LoginRequest,
+    LoginResponse,
     SessionsListResponse,
     SessionsReplaceRequest,
     SolveRequest,
     SolveResponse,
+    UserInfo,
 )
-from backend.sessions_store import ACTIVE_CHAT_SESSION_KEY, SessionsStore
+from backend.sessions_store import SessionsStore
+from backend.reports import build_report_docx, build_report_html
+from backend.user_store import UserStore, active_chat_key
 
 
 
@@ -88,10 +95,11 @@ def get_sessions_store() -> SessionsStore:
 def _clear_active_chat_if_deleted(
     session_ids: list[str],
     sessions_store: SessionsStore,
+    user_id: str,
 ) -> None:
-    active = sessions_store.get_app_state(ACTIVE_CHAT_SESSION_KEY)
+    active = sessions_store.get_app_state(active_chat_key(user_id))
     if active and active in session_ids:
-        sessions_store.set_app_state(ACTIVE_CHAT_SESSION_KEY, None)
+        sessions_store.set_app_state(active_chat_key(user_id), None)
 
 
 def _session_to_response(session: dict) -> ChatSessionResponse:
@@ -133,7 +141,7 @@ app.add_middleware(
 
     CORSMiddleware,
 
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000"],
 
     allow_credentials=True,
 
@@ -236,6 +244,8 @@ def root() -> dict[str, str]:
 
         "sessions": "GET/POST/PUT/DELETE /sessions",
 
+        "auth": "POST /auth/login, GET /auth/me",
+
     }
 
 
@@ -278,6 +288,29 @@ def health_check() -> HealthResponse:
 
 
 
+@app.post("/auth/login", response_model=LoginResponse, tags=["auth"])
+def login(
+    body: LoginRequest,
+    user_store: UserStore = Depends(get_user_store),
+) -> LoginResponse:
+    user = user_store.authenticate(body.username, body.password)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Неверный логин или пароль.")
+    token = create_access_token(user["id"], user["username"])
+    return LoginResponse(
+        access_token=token,
+        user=UserInfo(id=user["id"], username=user["username"]),
+    )
+
+
+@app.get("/auth/me", response_model=UserInfo, tags=["auth"])
+def auth_me(user: CurrentUser) -> UserInfo:
+    return UserInfo(id=user["id"], username=user["username"])
+
+
+
+
+
 @app.post(
 
     "/solve",
@@ -291,21 +324,15 @@ def health_check() -> HealthResponse:
 )
 
 def solve_problem(
-
     body: SolveRequest,
-
+    user: CurrentUser,
     chain: TRIZChain = Depends(get_chain),
-
     store: SessionsStore = Depends(get_sessions_store),
-
 ) -> SolveResponse:
-
     """Экспертный TRIZ-анализ через LLM (результат сохраняется в SQLite)."""
 
     result = chain.solve(body.problem)
-
-    store.add_entry(body.problem, result)
-
+    store.add_entry(body.problem, result, user_id=user["id"])
     return SolveResponse(**result)
 
 
@@ -316,11 +343,14 @@ def solve_problem(
     summary="Список сохранённых диалогов",
 )
 def list_chat_sessions(
+    user: CurrentUser,
     limit: int = 20,
     store: ChatStore = Depends(get_chat_store),
+    sessions_store: SessionsStore = Depends(get_sessions_store),
 ) -> ChatSessionsListResponse:
     cap = max(1, min(limit, 50))
-    rows = store.list_sessions(limit=cap)
+    active_id = sessions_store.get_app_state(active_chat_key(user["id"]))
+    rows = store.list_sessions(user["id"], limit=cap, keep_session_id=active_id)
     items = [ChatSessionSummary(**row) for row in rows]
     return ChatSessionsListResponse(items=items, limit=cap)
 
@@ -332,9 +362,10 @@ def list_chat_sessions(
     summary="Новая сессия интервью",
 )
 def create_chat_session(
+    user: CurrentUser,
     chat: ChatService = Depends(get_chat_service),
 ) -> ChatSessionResponse:
-    session = chat.create_session()
+    session = chat.create_session(user["id"])
     return _session_to_response(session)
 
 
@@ -346,9 +377,10 @@ def create_chat_session(
 )
 def get_chat_session(
     session_id: str,
+    user: CurrentUser,
     chat: ChatService = Depends(get_chat_service),
 ) -> ChatSessionResponse:
-    session = chat.get_session(session_id)
+    session = chat.get_session(session_id, user["id"])
     if session is None:
         raise HTTPException(status_code=404, detail="Сессия не найдена.")
     return _session_to_response(session)
@@ -362,14 +394,15 @@ def get_chat_session(
 )
 def delete_chat_session(
     session_id: str,
+    user: CurrentUser,
     chat_store: ChatStore = Depends(get_chat_store),
     sessions_store: SessionsStore = Depends(get_sessions_store),
 ) -> ChatSessionsDeleteResponse:
-    deleted = chat_store.delete_session(session_id)
+    deleted = chat_store.delete_session(session_id, user["id"])
     if not deleted:
         raise HTTPException(status_code=404, detail="Сессия не найдена.")
-    sessions_store.delete_entries_for_chat_sessions([session_id])
-    _clear_active_chat_if_deleted([session_id], sessions_store)
+    sessions_store.delete_entries_for_chat_sessions([session_id], user_id=user["id"])
+    _clear_active_chat_if_deleted([session_id], sessions_store, user["id"])
     return ChatSessionsDeleteResponse(deleted=1)
 
 
@@ -381,13 +414,14 @@ def delete_chat_session(
 )
 def bulk_delete_chat_sessions(
     body: ChatSessionsBulkDeleteRequest,
+    user: CurrentUser,
     chat_store: ChatStore = Depends(get_chat_store),
     sessions_store: SessionsStore = Depends(get_sessions_store),
 ) -> ChatSessionsDeleteResponse:
     ids = list(dict.fromkeys(body.ids))
-    count = chat_store.delete_sessions(ids)
-    sessions_store.delete_entries_for_chat_sessions(ids)
-    _clear_active_chat_if_deleted(ids, sessions_store)
+    count = chat_store.delete_sessions(ids, user["id"])
+    sessions_store.delete_entries_for_chat_sessions(ids, user_id=user["id"])
+    _clear_active_chat_if_deleted(ids, sessions_store, user["id"])
     return ChatSessionsDeleteResponse(deleted=count)
 
 
@@ -398,15 +432,16 @@ def bulk_delete_chat_sessions(
     summary="Удалить все диалоги",
 )
 def delete_all_chat_sessions(
+    user: CurrentUser,
     chat_store: ChatStore = Depends(get_chat_store),
     sessions_store: SessionsStore = Depends(get_sessions_store),
 ) -> ChatSessionsDeleteResponse:
-    rows = chat_store.list_sessions(limit=chat_store.max_sessions)
+    rows = chat_store.list_sessions(user["id"], limit=chat_store.max_sessions)
     ids = [row["id"] for row in rows]
-    count = chat_store.delete_all_sessions()
+    count = chat_store.delete_all_sessions(user["id"])
     if ids:
-        sessions_store.delete_entries_for_chat_sessions(ids)
-    sessions_store.set_app_state(ACTIVE_CHAT_SESSION_KEY, None)
+        sessions_store.delete_entries_for_chat_sessions(ids, user_id=user["id"])
+    sessions_store.set_app_state(active_chat_key(user["id"]), None)
     return ChatSessionsDeleteResponse(deleted=count)
 
 
@@ -419,9 +454,10 @@ def delete_all_chat_sessions(
 def post_chat_message(
     session_id: str,
     body: ChatMessageRequest,
+    user: CurrentUser,
     chat: ChatService = Depends(get_chat_service),
 ) -> ChatSessionResponse:
-    session = chat.send_message(session_id, body.content)
+    session = chat.send_message(session_id, body.content, user["id"])
     return _session_to_response(session)
 
 
@@ -433,9 +469,10 @@ def post_chat_message(
 )
 def complete_chat_session(
     session_id: str,
+    user: CurrentUser,
     chat: ChatService = Depends(get_chat_service),
 ) -> ChatSessionResponse:
-    session = chat.complete_interview(session_id)
+    session = chat.complete_interview(session_id, user["id"])
     return _session_to_response(session)
 
 
@@ -447,15 +484,56 @@ def complete_chat_session(
 )
 def analyze_chat_session(
     session_id: str,
+    user: CurrentUser,
+    body: ChatAnalyzeRequest | None = None,
     chat: ChatService = Depends(get_chat_service),
     store: SessionsStore = Depends(get_sessions_store),
 ) -> ChatAnalyzeResponse:
-    result, brief = chat.analyze(session_id)
-    store.add_entry(brief, result, chat_session_id=session_id)
+    opts = body or ChatAnalyzeRequest()
+    result, brief = chat.analyze(session_id, user["id"], force=opts.force)
+    store.add_entry(brief, result, chat_session_id=session_id, user_id=user["id"])
     return ChatAnalyzeResponse(
         session_id=session_id,
         brief=brief,
         result=SolveResponse(**result),
+    )
+
+
+@app.get(
+    "/chat/sessions/{session_id}/analyze/status",
+    response_model=AnalyzeProgressResponse,
+    tags=["chat"],
+    summary="Прогресс формирования отчёта",
+)
+def get_analyze_status(
+    session_id: str,
+    user: CurrentUser,
+    chat: ChatService = Depends(get_chat_service),
+) -> AnalyzeProgressResponse:
+    session = chat.get_session(session_id, user["id"])
+    if session is None:
+        raise HTTPException(status_code=404, detail="Сессия не найдена.")
+    state = analysis_progress.get(session_id)
+    if state is None:
+        if session["status"] == "analyzed":
+            return AnalyzeProgressResponse(
+                session_id=session_id,
+                progress=100,
+                stage="Готово",
+                status="completed",
+            )
+        return AnalyzeProgressResponse(
+            session_id=session_id,
+            progress=0,
+            stage="Ожидание",
+            status="idle",
+        )
+    return AnalyzeProgressResponse(
+        session_id=session_id,
+        progress=state.progress,
+        stage=state.stage,
+        status=state.status,
+        error=state.error,
     )
 
 
@@ -472,23 +550,16 @@ def analyze_chat_session(
 )
 
 def list_sessions(
-
+    user: CurrentUser,
     limit: int = 5,
-
     summary: bool = False,
-
     store: SessionsStore = Depends(get_sessions_store),
-
 ) -> SessionsListResponse:
-
     """Последние записи истории (новые первыми). summary=true — без тяжёлого result."""
 
     cap = max(1, min(limit, 20))
-
-    rows = store.list_entries(limit=cap, summary=summary)
-
+    rows = store.list_entries(user["id"], limit=cap, summary=summary)
     items = [HistoryEntry(**row) for row in rows]
-
     return SessionsListResponse(items=items, limit=cap)
 
 
@@ -505,19 +576,13 @@ def list_sessions(
 )
 
 def get_session_entry(
-
     entry_id: str,
-
+    user: CurrentUser,
     store: SessionsStore = Depends(get_sessions_store),
-
 ) -> HistoryEntry:
-
-    row = store.get_entry(entry_id)
-
+    row = store.get_entry(entry_id, user_id=user["id"])
     if row is None:
-
         raise HTTPException(status_code=404, detail="Запись не найдена.")
-
     return HistoryEntry(**row)
 
 
@@ -537,15 +602,13 @@ def get_session_entry(
 )
 
 def create_session_entry(
-
     body: HistoryEntryCreate,
-
+    user: CurrentUser,
     store: SessionsStore = Depends(get_sessions_store),
-
 ) -> HistoryEntry:
-
-    row = store.add_entry(body.problem, body.result, time_display=body.time)
-
+    row = store.add_entry(
+        body.problem, body.result, time_display=body.time, user_id=user["id"]
+    )
     return HistoryEntry(**row)
 
 
@@ -565,19 +628,13 @@ def create_session_entry(
 )
 
 def replace_sessions(
-
     body: SessionsReplaceRequest,
-
+    user: CurrentUser,
     store: SessionsStore = Depends(get_sessions_store),
-
 ) -> SessionsListResponse:
-
     rows = [item.model_dump() for item in body.items]
-
     saved = store.replace_all(rows)
-
     items = [HistoryEntry(**row) for row in saved]
-
     return SessionsListResponse(items=items, limit=store.max_entries)
 
 
@@ -596,9 +653,11 @@ def replace_sessions(
 
 )
 
-def clear_sessions(store: SessionsStore = Depends(get_sessions_store)) -> None:
-
-    store.clear()
+def clear_sessions(
+    user: CurrentUser,
+    store: SessionsStore = Depends(get_sessions_store),
+) -> None:
+    store.clear(user_id=user["id"])
 
 
 @app.get(
@@ -608,9 +667,10 @@ def clear_sessions(store: SessionsStore = Depends(get_sessions_store)) -> None:
     summary="Активный диалог (SQLite)",
 )
 def get_active_chat(
+    user: CurrentUser,
     store: SessionsStore = Depends(get_sessions_store),
 ) -> ActiveChatStateResponse:
-    session_id = store.get_app_state(ACTIVE_CHAT_SESSION_KEY)
+    session_id = store.get_app_state(active_chat_key(user["id"]))
     return ActiveChatStateResponse(session_id=session_id)
 
 
@@ -622,10 +682,104 @@ def get_active_chat(
 )
 def set_active_chat(
     body: ActiveChatStateUpdate,
+    user: CurrentUser,
     store: SessionsStore = Depends(get_sessions_store),
 ) -> ActiveChatStateResponse:
-    store.set_app_state(ACTIVE_CHAT_SESSION_KEY, body.session_id)
+    store.set_app_state(active_chat_key(user["id"]), body.session_id)
     return ActiveChatStateResponse(session_id=body.session_id)
+
+
+def _report_filename(prefix: str, ext: str) -> str:
+    ts = time.strftime("%Y%m%d_%H%M")
+    return f"triz_report_{prefix}_{ts}.{ext}"
+
+
+@app.get(
+    "/sessions/{entry_id}/report.html",
+    tags=["reports"],
+    summary="Скачать HTML-отчёт по записи истории",
+)
+def download_report_html_by_entry(
+    entry_id: str,
+    user: CurrentUser,
+    store: SessionsStore = Depends(get_sessions_store),
+) -> Response:
+    row = store.get_entry(entry_id, user_id=user["id"])
+    if row is None:
+        raise HTTPException(status_code=404, detail="Запись не найдена.")
+    html = build_report_html(row["problem"], row["result"])
+    filename = _report_filename(entry_id[:8], "html")
+    return Response(
+        content=html,
+        media_type="text/html; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get(
+    "/sessions/{entry_id}/report.docx",
+    tags=["reports"],
+    summary="Скачать DOCX-отчёт по записи истории",
+)
+def download_report_docx_by_entry(
+    entry_id: str,
+    user: CurrentUser,
+    store: SessionsStore = Depends(get_sessions_store),
+) -> Response:
+    row = store.get_entry(entry_id, user_id=user["id"])
+    if row is None:
+        raise HTTPException(status_code=404, detail="Запись не найдена.")
+    docx_bytes = build_report_docx(row["problem"], row["result"])
+    filename = _report_filename(entry_id[:8], "docx")
+    return Response(
+        content=docx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get(
+    "/chat/sessions/{session_id}/report.html",
+    tags=["reports"],
+    summary="Скачать HTML-отчёт по диалогу",
+)
+def download_report_html_by_chat(
+    session_id: str,
+    user: CurrentUser,
+    store: SessionsStore = Depends(get_sessions_store),
+) -> Response:
+    row = store.get_entry_by_chat_session(session_id, user["id"])
+    if row is None:
+        raise HTTPException(status_code=404, detail="Отчёт для этой сессии не найден.")
+    html = build_report_html(row["problem"], row["result"])
+    filename = _report_filename(session_id[:8], "html")
+    return Response(
+        content=html,
+        media_type="text/html; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get(
+    "/chat/sessions/{session_id}/report.docx",
+    tags=["reports"],
+    summary="Скачать DOCX-отчёт по диалогу",
+)
+def download_report_docx_by_chat(
+    session_id: str,
+    user: CurrentUser,
+    store: SessionsStore = Depends(get_sessions_store),
+) -> Response:
+    row = store.get_entry_by_chat_session(session_id, user["id"])
+    if row is None:
+        raise HTTPException(status_code=404, detail="Отчёт для этой сессии не найден.")
+    docx_bytes = build_report_docx(row["problem"], row["result"])
+    filename = _report_filename(session_id[:8], "docx")
+    return Response(
+        content=docx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 

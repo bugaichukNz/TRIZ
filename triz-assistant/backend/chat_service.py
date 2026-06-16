@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import logging
 
+from backend.analysis_progress import analysis_progress
 from backend.chat_brief import compile_interview_brief
-from backend.chat_store import STATUS_ANALYZED, STATUS_READY, ChatStore
-from backend.llm.chain import TRIZChain
+from backend.chat_store import STATUS_ANALYZED, STATUS_INTERVIEW, STATUS_READY, ChatStore
+from backend.llm.chain import TRIZChain, TRIZChainError
 
 logger = logging.getLogger(__name__)
 
@@ -20,18 +21,18 @@ class ChatService:
         self._store = store
         self._chain = chain
 
-    def create_session(self) -> dict:
-        return self._store.create_session()
+    def create_session(self, user_id: str) -> dict:
+        return self._store.create_session(user_id)
 
-    def get_session(self, session_id: str) -> dict | None:
-        return self._store.get_session(session_id)
+    def get_session(self, session_id: str, user_id: str) -> dict | None:
+        return self._store.get_session(session_id, user_id=user_id)
 
-    def send_message(self, session_id: str, content: str) -> dict:
+    def send_message(self, session_id: str, content: str, user_id: str) -> dict:
         content = content.strip()
         if not content:
             raise ChatServiceError("Сообщение не может быть пустым.")
 
-        session = self._store.get_session(session_id)
+        session = self._store.get_session(session_id, user_id=user_id)
         if session is None:
             raise ChatServiceError("Сессия не найдена.")
         if session["status"] == STATUS_ANALYZED:
@@ -47,22 +48,34 @@ class ChatService:
         session = self._store.append_assistant_message(session_id, reply)
         return session
 
-    def complete_interview(self, session_id: str) -> dict:
-        session = self._store.get_session(session_id)
+    def complete_interview(self, session_id: str, user_id: str) -> dict:
+        session = self._store.get_session(session_id, user_id=user_id)
         if session is None:
             raise ChatServiceError("Сессия не найдена.")
         if session["status"] == STATUS_ANALYZED:
             raise ChatServiceError("Сессия уже проанализирована.")
         return self._store.mark_ready(session_id)
 
-    def analyze(self, session_id: str) -> tuple[dict, str]:
-        session = self._store.get_session(session_id)
+    def analyze(
+        self, session_id: str, user_id: str, *, force: bool = False
+    ) -> tuple[dict, str]:
+        session = self._store.get_session(session_id, user_id=user_id)
         if session is None:
             raise ChatServiceError("Сессия не найдена.")
         if session["status"] == STATUS_ANALYZED:
             raise ChatServiceError("Анализ для этой сессии уже выполнен.")
 
-        if session["status"] != STATUS_READY:
+        if force and session["status"] == STATUS_INTERVIEW:
+            has_user_reply = any(
+                m.get("role") == "user" and (m.get("content") or "").strip()
+                for m in session["messages"]
+            )
+            if not has_user_reply:
+                raise ChatServiceError(
+                    "Для принудительного анализа ответьте хотя бы на один вопрос."
+                )
+            session = self._store.mark_ready(session_id)
+        elif session["status"] != STATUS_READY:
             if len(session["messages"]) < 3:
                 raise ChatServiceError(
                     "Недостаточно данных для анализа. Продолжите интервью."
@@ -74,6 +87,19 @@ class ChatService:
             raise ChatServiceError("Не удалось сформировать бриф интервью.")
 
         logger.info("TRIZ analyze from chat session %s, brief_len=%d", session_id, len(brief))
-        result = self._chain.solve(brief)
-        self._store.mark_analyzed(session_id, brief)
-        return result, brief
+        analysis_progress.start(session_id)
+
+        def on_progress(pct: int, stage: str) -> None:
+            analysis_progress.update(session_id, pct, stage)
+
+        try:
+            result = self._chain.solve(brief, on_progress=on_progress)
+            self._store.mark_analyzed(session_id, brief)
+            analysis_progress.complete(session_id)
+            return result, brief
+        except TRIZChainError as exc:
+            analysis_progress.fail(session_id, str(exc))
+            raise
+        except Exception as exc:
+            analysis_progress.fail(session_id, str(exc))
+            raise
