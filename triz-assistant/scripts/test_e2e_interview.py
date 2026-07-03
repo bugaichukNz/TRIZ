@@ -22,6 +22,7 @@ from backend.chat_brief import compile_interview_brief  # noqa: E402
 from backend.chat_store import ChatStore  # noqa: E402
 from backend.llm.chain import TRIZChain, TRIZChainError  # noqa: E402
 from backend.llm.chat_prompt import CHAT_OPENING_MESSAGE, READY_FOR_ANALYSIS_MARKER  # noqa: E402
+from backend.llm.models import build_recommendations  # noqa: E402
 from backend.llm.interview_state import (  # noqa: E402
     BLOCKS,
     InterviewStateManager,
@@ -103,6 +104,43 @@ STEP_21_PATTERNS: tuple[tuple[str, ...], ...] = (
     ("постановка задачи", "инструмент 2"),
 )
 
+CORE_KEYS = (
+    "problem_description",
+    "assumptions",
+    "system_context",
+    "technical_contradiction",
+    "physical_contradiction",
+    "contradiction_type",
+    "ideal_final_result",
+    "root_cause",
+    "analysis",
+    "triz_tools",
+    "known_solutions",
+    "why_failed",
+    "unrealized_ideas",
+)
+
+SOLUTION_TEXT_FIELDS = ("title", "triz_principle", "mechanism", "applicability", "risks")
+SCORE_FIELDS = (
+    "effectiveness_score",
+    "complexity_score",
+    "cost_score",
+    "scalability_score",
+)
+
+DOCX_REQUIRED_SECTIONS = (
+    "Описание задачи",
+    "Система и надсистема",
+    ("Идеальный конечный результат", "ИКР"),
+    "Применённые инструменты",
+    "Решения",
+    "Сравнение решений",
+    "Рекомендации",
+    "Итоговый вывод",
+)
+
+FINAL_CONCLUSION_FIELDS = ("recommended_solution", "key_risk", "next_step")
+
 
 @dataclass
 class ScenarioStats:
@@ -135,6 +173,36 @@ def _next_missing_field(confirmed: dict[str, str]) -> str | None:
 
 def _state_from_messages(messages: list[dict[str, str]]) -> InterviewStateManager:
     return InterviewStateManager(messages)
+
+
+def _extract_core(solve_result: dict) -> dict:
+    return {key: solve_result[key] for key in CORE_KEYS if key in solve_result}
+
+
+def _score_in_range(value: object) -> bool:
+    try:
+        score = int(value)
+    except (TypeError, ValueError):
+        return False
+    return 1 <= score <= 10
+
+
+def _valid_triz_principle(principle: str) -> bool:
+    text = principle.strip()
+    if len(text) <= 10:
+        return False
+    generic = text.lower().replace("«", "").replace("»", "").strip(" .-—:")
+    return generic not in ("триз", "принцип триз", "метод триз")
+
+
+def _paragraph_text(doc: object) -> str:
+    return "\n".join(p.text for p in doc.paragraphs)
+
+
+def _docx_section_found(text: str, section: str | tuple[str, ...]) -> bool:
+    if isinstance(section, tuple):
+        return any(part in text for part in section)
+    return section in text
 
 
 def _make_store() -> tuple[ChatStore, Path]:
@@ -404,11 +472,12 @@ def scenario_brief(messages: list[dict[str, str]]) -> tuple[ScenarioStats, str |
     return stats, brief
 
 
-def scenario_analysis(chain: TRIZChain, brief: str) -> ScenarioStats:
+def scenario_analysis(chain: TRIZChain, brief: str) -> tuple[ScenarioStats, dict | None]:
     print("\n" + "=" * 72)
     print("СЦЕНАРИЙ 5 — Анализ (chain.solve)")
     print("=" * 72)
     stats = ScenarioStats("Сценарий 5")
+    result: dict | None = None
 
     try:
         print("  Запуск solve() — может занять несколько минут...")
@@ -450,6 +519,198 @@ def scenario_analysis(chain: TRIZChain, brief: str) -> ScenarioStats:
         print(f"  ERROR (TRIZChain): {exc}")
         stats.failed += 1
         stats.errors.append(str(exc))
+        result = None
+    except Exception as exc:
+        print(f"  ERROR: {exc}")
+        traceback.print_exc()
+        stats.failed += 1
+        stats.errors.append(str(exc))
+        result = None
+
+    return stats, result
+
+
+def scenario_solutions(
+    chain: TRIZChain,
+    brief: str,
+    solve_result: dict,
+) -> tuple[ScenarioStats, dict | None]:
+    print("\n" + "=" * 72)
+    print("СЦЕНАРИЙ 6 — Генерация решений (solution_concepts)")
+    print("=" * 72)
+    stats = ScenarioStats("Сценарий 6")
+    payload: dict | None = None
+
+    generate_fn = getattr(chain, "_validate_and_generate_solutions", None)
+    assemble_fn = getattr(chain, "_assemble_payload", None)
+    if generate_fn is None or assemble_fn is None:
+        looked = (
+            "backend/llm/chain.py: TRIZChain._validate_and_generate_solutions, "
+            "TRIZChain._assemble_payload"
+        )
+        stats.ok(
+            False,
+            f"этап solution_concepts не реализован в пайплайне (искал: {looked})",
+        )
+        return stats, None
+
+    try:
+        core = _extract_core(solve_result)
+        stats.ok(bool(core), "ядро анализа извлечено из результата solve()")
+
+        print("  Запуск _validate_and_generate_solutions() — может занять несколько минут...")
+        solutions, warning, attempts = generate_fn(core, brief)
+        if warning:
+            print(f"  Предупреждение генерации: {warning}")
+        print(f"  Попыток генерации: {attempts}, решений: {len(solutions)}")
+
+        payload = assemble_fn(core, solutions)
+
+        concepts = payload.get("solution_concepts") or []
+        stats.ok(isinstance(concepts, list) and len(concepts) >= 2, "solution_concepts: минимум 2 решения")
+
+        print("\n--- solution_concepts ---")
+        for sol in concepts:
+            if not isinstance(sol, dict):
+                sol = sol.model_dump() if hasattr(sol, "model_dump") else dict(sol)
+            title = sol.get("title", "—")
+            principle = sol.get("triz_principle", "—")
+            scores = ", ".join(f"{k}={sol.get(k)}" for k in SCORE_FIELDS)
+            print(f"  • {title}")
+            print(f"    triz_principle: {principle}")
+            print(f"    оценки: {scores}")
+
+            for field in SOLUTION_TEXT_FIELDS:
+                stats.ok(
+                    bool(str(sol.get(field) or "").strip()),
+                    f"решение #{sol.get('id', '?')}: поле {field!r} заполнено",
+                )
+            for field in SCORE_FIELDS:
+                stats.ok(
+                    _score_in_range(sol.get(field)),
+                    f"решение #{sol.get('id', '?')}: {field} в диапазоне 1–10",
+                )
+            stats.ok(
+                _valid_triz_principle(str(sol.get("triz_principle") or "")),
+                f"решение #{sol.get('id', '?')}: triz_principle ссылается на конкретный инструмент/приём",
+            )
+
+        recommendations = payload.get("recommendations") or {}
+        stats.ok(bool(recommendations), "recommendations заполнены после этапа решений")
+        if isinstance(recommendations, dict):
+            has_rec_content = any(
+                bool(recommendations.get(key))
+                for key in (
+                    "priorities",
+                    "quick_checks",
+                    "mvp_pilots",
+                    "critical_risks",
+                    "experiments",
+                    "metrics",
+                )
+            )
+            stats.ok(has_rec_content, "recommendations содержат хотя бы один непустой блок")
+
+        conclusion = payload.get("final_conclusion") or {}
+        stats.ok(bool(conclusion), "final_conclusion заполнен после этапа решений")
+        if isinstance(conclusion, dict):
+            for field in FINAL_CONCLUSION_FIELDS:
+                stats.ok(
+                    bool(str(conclusion.get(field) or "").strip()),
+                    f"final_conclusion.{field} заполнен",
+                )
+
+        # Дублируем детерминированный этап рекомендаций из models.build_recommendations
+        tail = build_recommendations(core, solutions)
+        stats.ok(
+            bool(tail.get("recommendations")) and bool(tail.get("final_conclusion")),
+            "build_recommendations(core, solutions) возвращает recommendations и final_conclusion",
+        )
+
+    except TRIZChainError as exc:
+        print(f"  ERROR (TRIZChain): {exc}")
+        stats.failed += 1
+        stats.errors.append(str(exc))
+        payload = None
+    except Exception as exc:
+        print(f"  ERROR: {exc}")
+        traceback.print_exc()
+        stats.failed += 1
+        stats.errors.append(str(exc))
+        payload = None
+
+    return stats, payload
+
+
+def scenario_docx_report(
+    brief: str,
+    full_result: dict,
+    *,
+    output_dir: Path,
+) -> ScenarioStats:
+    print("\n" + "=" * 72)
+    print("СЦЕНАРИЙ 7 — DOCX-отчёт")
+    print("=" * 72)
+    stats = ScenarioStats("Сценарий 7")
+
+    try:
+        from backend.reports import build_report_docx  # noqa: WPS433
+    except ImportError:
+        looked = "backend/reports/__init__.py, backend/reports/docx_builder.py"
+        stats.ok(False, f"генерация DOCX не реализована (искал: {looked})")
+        return stats
+
+    docx_module = Path(PROJECT_ROOT / "backend" / "reports" / "docx_builder.py")
+    if not docx_module.is_file():
+        stats.ok(
+            False,
+            "генерация DOCX не реализована (искал: backend/reports/docx_builder.py)",
+        )
+        return stats
+
+    try:
+        print("  Запуск build_report_docx()...")
+        docx_bytes = build_report_docx(brief, full_result)
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        docx_path = output_dir / "triz_e2e_report.docx"
+        docx_path.write_bytes(docx_bytes)
+
+        size_kb = len(docx_bytes) / 1024
+        stats.ok(len(docx_bytes) > 20 * 1024, f"файл создан, размер {size_kb:.1f} КБ (> 20 КБ)")
+
+        from docx import Document  # noqa: WPS433
+
+        doc = Document(str(docx_path))
+        text = _paragraph_text(doc)
+
+        for section in DOCX_REQUIRED_SECTIONS:
+            stats.ok(
+                _docx_section_found(text, section),
+                f"раздел найден: {section!r}",
+            )
+
+        table_count = len(doc.tables)
+        stats.ok(table_count >= 4, f"таблиц в документе: {table_count} (минимум 4)")
+
+        image_count = len(doc.inline_shapes)
+        stats.ok(image_count >= 1, f"изображений (inline_shapes): {image_count} (минимум 1)")
+
+        print("\n--- DOCX ---")
+        print(f"  параграфов: {len(doc.paragraphs)}")
+        print(f"  таблиц: {table_count}")
+        print(f"  изображений: {image_count}")
+        print(f"  путь: {docx_path}")
+
+    except ImportError as exc:
+        msg = str(exc)
+        if "python-docx" in msg or "matplotlib" in msg:
+            stats.ok(False, f"зависимости DOCX недоступны: {msg}")
+        else:
+            stats.ok(
+                False,
+                f"генерация DOCX не реализована (backend/reports/docx_builder.py): {exc}",
+            )
     except Exception as exc:
         print(f"  ERROR: {exc}")
         traceback.print_exc()
@@ -466,9 +727,13 @@ def main() -> int:
     all_stats: list[ScenarioStats] = []
     scenario1_messages: list[dict[str, str]] | None = None
     brief: str | None = None
+    solve_result: dict | None = None
+    full_payload: dict | None = None
 
     store, tmpdir = _make_store()
+    docx_dir = tmpdir / "reports"
     print(f"Временная БД: {tmpdir}")
+    print(f"DOCX для осмотра: {docx_dir}")
 
     try:
         chain = TRIZChain()
@@ -492,10 +757,22 @@ def main() -> int:
         print("\nСЦЕНАРИЙ 4 пропущен: нет сообщений из сценария 1")
 
     if brief:
-        stats5 = scenario_analysis(chain, brief)
+        stats5, solve_result = scenario_analysis(chain, brief)
         all_stats.append(stats5)
     else:
         print("\nСЦЕНАРИЙ 5 пропущен: нет брифа из сценария 4")
+
+    if brief and solve_result:
+        stats6, full_payload = scenario_solutions(chain, brief, solve_result)
+        all_stats.append(stats6)
+    else:
+        print("\nСЦЕНАРИЙ 6 пропущен: нет результата solve() из сценария 5")
+
+    if brief and full_payload:
+        stats7 = scenario_docx_report(brief, full_payload, output_dir=docx_dir)
+        all_stats.append(stats7)
+    else:
+        print("\nСЦЕНАРИЙ 7 пропущен: нет полного payload из сценария 6")
 
     total_passed = sum(s.passed for s in all_stats)
     total_failed = sum(s.failed for s in all_stats)

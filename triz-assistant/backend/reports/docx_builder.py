@@ -14,6 +14,7 @@ try:
     import matplotlib.pyplot as plt
     from docx import Document
     from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
     from docx.shared import Cm, Inches, Pt, RGBColor
     from docx.table import _Cell
@@ -38,9 +39,12 @@ FONT_NAME = "Arial"
 
 
 def _set_cell_shading(cell: _Cell, fill_hex: str) -> None:
-    shading = cell._tc.get_or_add_tcPr()
-    shd = shading.get_or_add_shd()
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
     shd.set(qn("w:fill"), fill_hex)
+    tc_pr.append(shd)
 
 
 def _style_header_row(row, cols: int) -> None:
