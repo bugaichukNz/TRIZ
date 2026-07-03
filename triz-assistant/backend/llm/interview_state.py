@@ -14,6 +14,23 @@ _DIALOG_TAIL = 6
 _SKIPPED_VALUE = "—"
 _MAX_FIELD_ATTEMPTS = 2
 
+_SKIP_MARKERS = (
+    "не знаю",
+    "не известно",
+    "неизвестно",
+    "нет данных",
+    "затрудняюсь",
+    "трудно сказать",
+    "не могу сказать",
+    "пропустить",
+    "пропусти",
+)
+
+
+def _is_skip_answer(text: str) -> bool:
+    t = text.strip().lower()
+    return len(t) < 40 and any(m in t for m in _SKIP_MARKERS)
+
 _RETRY_HINTS: dict[str, str] = {
     "ne_when": (
         "Предыдущий ответ отклонён (тавтология). Переспроси с уточнением: "
@@ -265,29 +282,39 @@ class InterviewStateManager:
         *,
         reject_field: Callable[[str, str], bool] | None = None,
         messages: list[dict[str, str]] | None = None,
-    ) -> None:
-        """Подтверждает ответ пользователя на поле pending_field."""
+    ) -> bool:
+        """Подтверждает ответ пользователя на поле pending_field. True — поле пропущено."""
         text = self.sanitize_user_answer(answer, messages)
         field = self._state.get("pending_field")
 
         if not field or field in self._state["confirmed"]:
             self._state["pending_field"] = None
-            return
+            return False
 
         if not text:
             logger.debug("Пустой ответ после очистки для %s", field)
             self._bump_attempt(field)
             self._state["pending_field"] = None
-            return
+            return False
+
+        if _is_skip_answer(text):
+            self._state["confirmed"][field] = _SKIPPED_VALUE
+            if field not in self._state["asked"]:
+                self._state["asked"].append(field)
+            self._state.setdefault("attempts", {}).pop(field, None)
+            self._state["pending_field"] = None
+            logger.debug("Поле %s пропущено пользователем (отказ от ответа)", field)
+            return True
 
         if reject_field and reject_field(field, text):
             logger.debug("Ответ на %s отклонён валидатором", field)
             self._bump_attempt(field)
             self._state["pending_field"] = None
-            return
+            return False
 
         self.confirm_manual(field, text)
         self._state["pending_field"] = None
+        return False
 
     def prepare_next_pending(self) -> None:
         """Выставляет pending_field на поле следующего вопроса (до вызова LLM)."""

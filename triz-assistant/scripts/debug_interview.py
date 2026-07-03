@@ -405,7 +405,7 @@ def scenario_compile_brief() -> None:
         ), f'пропуск "{_SKIPPED_VALUE}" попал в бриф как значение поля'
 
         confirmed_part = brief.split(_GAPS_HEADER)[0]
-        assert "## Подтверждённые данные" in confirmed_part
+        assert "## Подтверждённые данные (с привязкой к входам инструментов ТРИЗ)" in confirmed_part
         assert ne_fact in confirmed_part, "ne_fact отсутствует в подтверждённых данных"
         assert ne_where in confirmed_part, "ne_where отсутствует в подтверждённых данных"
         assert ne_when_label not in confirmed_part, "пропущенное поле попало в подтверждённые данные"

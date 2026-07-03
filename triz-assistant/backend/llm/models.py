@@ -27,10 +27,16 @@ class AnalysisBlock(BaseModel):
 class TrizToolRow(BaseModel):
     """Применённый инструмент ТРИЗ."""
 
-    tool: str
-    why_applied: str
-    insight: str
-    practical_value: str
+    tool: str = Field(
+        description=(
+            "Название инструмента ТРИЗ НА РУССКОМ ЯЗЫКЕ с номером по карте связей, "
+            "например: 'Инструмент 11 — Причинно-следственный анализ (ПСА)', "
+            "'Инструмент 14 — Компонентно-структурный анализ (КСА)'"
+        )
+    )
+    why_applied: str = Field(description="Почему инструмент применён к данной задаче")
+    insight: str = Field(description="Ключевой вывод или инсайт от применения инструмента")
+    practical_value: str = Field(description="Практическая ценность результата для решения задачи")
 
 
 class SolutionConcept(BaseModel):
@@ -135,7 +141,9 @@ class TRIZAnalysisCore(BaseModel):
         )
     )
     analysis: AnalysisBlock
-    triz_tools: list[TrizToolRow]
+    triz_tools: list[TrizToolRow] = Field(
+        description="Применённые инструменты ТРИЗ с обоснованием (названия только на русском)"
+    )
     known_solutions: str = Field(
         default="",
         description="Известные попытки решения из брифа (конкретные тупики, не описание задачи)",
@@ -172,7 +180,9 @@ class TRIZAnalysisResult(BaseModel):
         )
     )
     analysis: AnalysisBlock
-    triz_tools: list[TrizToolRow]
+    triz_tools: list[TrizToolRow] = Field(
+        description="Применённые инструменты ТРИЗ с обоснованием (названия только на русском)"
+    )
     solution_concepts: list[SolutionConcept] = Field(min_length=2)
     recommendations: RecommendationsBlock
     final_conclusion: FinalConclusionBlock
