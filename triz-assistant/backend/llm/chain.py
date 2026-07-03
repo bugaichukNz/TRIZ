@@ -55,6 +55,24 @@ from backend.llm.system_prompt import CORE_SYSTEM_PROMPT, CORE_USER_PROMPT
 
 logger = logging.getLogger(__name__)
 
+_MANDATORY_TOOL_MARKERS: dict[str, tuple[str, ...]] = {
+    "Инструмент 2": ("инструмент 2", "постановка задачи"),
+    "Инструмент 14 (КСА)": ("инструмент 14", "кса", "компонентно-структурн"),
+    "Инструмент 11 (ПСА)": ("инструмент 11", "пса", "причинно-следств"),
+}
+
+
+def _missing_mandatory_tools(result: dict) -> list[str]:
+    tools_text = " ".join(
+        (t.get("tool") or "").lower() for t in result.get("triz_tools", [])
+    )
+    return [
+        name
+        for name, markers in _MANDATORY_TOOL_MARKERS.items()
+        if not any(m in tools_text for m in markers)
+    ]
+
+
 _BRIEF_FIELD_PATTERNS: dict[str, re.Pattern[str]] = {
     "known_solutions": re.compile(
         r"(?:^|\n)\s*[•\-]\s*(?:Известные попытки решения|Известные решения)"
@@ -629,6 +647,24 @@ class TRIZChain:
         _progress(5, "Подготовка к анализу")
         _progress(10, "TRIZ core-анализ")
         core = self._run_core_analysis(problem)
+        missing = _missing_mandatory_tools(core)
+        if missing:
+            logger.info(
+                "Обязательные инструменты ШАГ 2.1 отсутствуют после первого прохода: %s — повтор",
+                missing,
+            )
+            retry_note = (
+                "\n\nВАЖНО: в предыдущем анализе отсутствовали обязательные инструменты "
+                f"ШАГ 2.1: {', '.join(missing)}. Включи их в triz_tools с конкретными "
+                "результатами применения к данной задаче."
+            )
+            core = self._run_core_analysis(problem + retry_note)
+            still_missing = _missing_mandatory_tools(core)
+            if still_missing:
+                logger.warning(
+                    "Обязательные инструменты ШАГ 2.1 всё ещё отсутствуют после повтора: %s",
+                    still_missing,
+                )
         logger.info(
             "TRIZ core-анализ завершён: тип=%s, инструментов=%d",
             core.get("contradiction_type"),
