@@ -153,6 +153,25 @@ export interface HistoryEntry {
 
 export interface SolveRequest {
   problem: string
+  chat_session_id?: string | null
+  force?: boolean
+}
+
+export interface SolveJobCreateResponse {
+  job_id: string
+  status: 'running'
+}
+
+export interface SolveJobProgress {
+  pct: number
+  stage: string
+}
+
+export interface SolveJobStatusResponse {
+  status: 'running' | 'done' | 'error'
+  progress: SolveJobProgress
+  result: SolveResponse | null
+  error: string | null
 }
 
 export interface SolveResponse extends TRIZAnalysisResult {}

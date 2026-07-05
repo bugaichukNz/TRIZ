@@ -1,4 +1,4 @@
-import { createApi, fetchBaseQuery } from '@reduxjs/toolkit/query/react'
+﻿import { createApi, fetchBaseQuery } from '@reduxjs/toolkit/query/react'
 import { clearAuthSession, getAuthToken } from './authToken'
 import type {
   ActiveChatStateResponse,
@@ -14,6 +14,8 @@ import type {
   LoginResponse,
   SolveRequest,
   SolveResponse,
+  SolveJobCreateResponse,
+  SolveJobStatusResponse,
   TRIZAnalysisResult,
 } from '../types/triz'
 
@@ -42,6 +44,22 @@ const baseQuery: typeof rawBaseQuery = async (args, api, extraOptions) => {
     }
   }
   return result
+}
+
+export type GetSolveJobStatusArg = string | { jobId: string; signal?: AbortSignal }
+
+export function isAbortError(err: unknown): boolean {
+  if (err instanceof DOMException && err.name === 'AbortError') return true
+  if (err && typeof err === 'object' && 'name' in err && (err as { name: string }).name === 'AbortError') {
+    return true
+  }
+  if (err && typeof err === 'object' && 'error' in err) {
+    const inner = (err as { error: unknown }).error
+    if (inner && typeof inner === 'object' && 'name' in inner && (inner as { name: string }).name === 'AbortError') {
+      return true
+    }
+  }
+  return false
 }
 
 export function isSessionNotFoundError(err: unknown): boolean {
@@ -120,9 +138,6 @@ export const trizApi = createApi({
       async onQueryStarted({ sessionId, content }, { dispatch, queryFulfilled }) {
         const trimmed = content.trim()
         let patch: { undo: () => void } | undefined
-        // Optimistic UI: сразу добавляем пользовательское сообщение в кеш.
-        // Если кеш ещё не инициализирован (редко, но бывает при быстрой навигации),
-        // то просто пропускаем оптимизм.
         try {
           patch = dispatch(
             trizApi.util.updateQueryData('getChatSession', sessionId, (draft) => {
@@ -133,11 +148,7 @@ export const trizApi = createApi({
           /* no cache yet */
         }
         try {
-          // В теле ответа сервер возвращает обновлённую сессию целиком:
-          // включая ответ аналитика в `messages`.
           const { data: freshSession } = await queryFulfilled
-
-          // Обновляем кеш живого запроса так, чтобы UI мгновенно отрендерил fresh `messages`.
           try {
             dispatch(
               trizApi.util.updateQueryData('getChatSession', sessionId, (draft) => {
@@ -145,7 +156,6 @@ export const trizApi = createApi({
               }),
             )
           } catch {
-            // Если кеш ещё не был подписан/инициализирован — используем upsert.
             dispatch(trizApi.util.upsertQueryData('getChatSession', sessionId, freshSession))
           }
         } catch {
@@ -233,6 +243,25 @@ export const trizApi = createApi({
       invalidatesTags: [{ type: 'History', id: 'LIST' }],
     }),
 
+    createSolveJob: builder.mutation<SolveJobCreateResponse, SolveRequest>({
+      query: (body) => ({
+        url: '/solve/jobs',
+        method: 'POST',
+        body,
+      }),
+    }),
+
+    getSolveJobStatus: builder.query<SolveJobStatusResponse, GetSolveJobStatusArg>({
+      query: (arg) => {
+        const jobId = typeof arg === 'string' ? arg : arg.jobId
+        const signal = typeof arg === 'string' ? undefined : arg.signal
+        return {
+          url: `/solve/jobs/${jobId}`,
+          ...(signal ? { signal } : {}),
+        }
+      },
+    }),
+
     listHistory: builder.query<{ items: HistoryEntry[]; limit: number }, { limit?: number; summary?: boolean } | void>({
       query: (args) => {
         const limit = args?.limit ?? 20
@@ -265,6 +294,8 @@ export const {
   useGetActiveChatQuery,
   useSetActiveChatMutation,
   useSolveMutation,
+  useCreateSolveJobMutation,
+  useLazyGetSolveJobStatusQuery,
   useListHistoryQuery,
   useGetHistoryEntryQuery,
 } = trizApi

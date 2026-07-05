@@ -305,11 +305,7 @@ def _dominant_mechanism_clusters(
             if sid is not None and int(sid) not in stem_to_ids[stem]:
                 stem_to_ids[stem].append(int(sid))
 
-    clusters = [
-        (stem, len(ids), ids)
-        for stem, ids in stem_to_ids.items()
-        if len(ids) >= 2
-    ]
+    clusters = [(stem, len(ids), ids) for stem, ids in stem_to_ids.items() if len(ids) >= 2]
     clusters.sort(key=lambda item: item[1], reverse=True)
     return clusters
 
@@ -362,8 +358,7 @@ def _heuristic_diversity_check(solutions: list[dict]) -> tuple[bool, str]:
     for stem, count, ids in clusters:
         if count >= 3:
             issues.append(
-                f"{count} решений в одном механизме «{stem}» "
-                f"({', '.join(f'#{i}' for i in ids)})"
+                f"{count} решений в одном механизме «{stem}» ({', '.join(f'#{i}' for i in ids)})"
             )
         elif count >= len(solutions) and len(solutions) >= 2:
             issues.append(f"все решения в механизме «{stem}»")
@@ -371,9 +366,7 @@ def _heuristic_diversity_check(solutions: list[dict]) -> tuple[bool, str]:
     principle_counts = Counter(principles)
     dup_principles = [p for p, c in principle_counts.items() if c >= 2]
     if dup_principles and len(solutions) >= 3:
-        issues.append(
-            "повторяются ТРИЗ-принципы: " + ", ".join(sorted(dup_principles))
-        )
+        issues.append("повторяются ТРИЗ-принципы: " + ", ".join(sorted(dup_principles)))
 
     if issues:
         return False, _format_diversity_feedback(
@@ -417,10 +410,7 @@ def check_solution_diversity(
         return True, ""
 
     principles = [_principle_key(sol) for sol in solutions]
-    if (
-        len(set(principles)) == len(solutions)
-        and not _dominant_mechanism_clusters(solutions)
-    ):
+    if len(set(principles)) == len(solutions) and not _dominant_mechanism_clusters(solutions):
         return True, ""
 
     try:
@@ -447,10 +437,7 @@ def check_solution_diversity(
     if not result.distinct_mechanisms:
         issues.append("повторяются механизмы/ресурсы")
     if not result.resolution_axes and result.missing_axes:
-        issues.append(
-            "не представлены оси разрешения ФП: "
-            + ", ".join(result.missing_axes)
-        )
+        issues.append("не представлены оси разрешения ФП: " + ", ".join(result.missing_axes))
     return False, _format_diversity_feedback(
         issues=issues or ["недостаточное разнообразие набора"],
         clusters=clusters,
@@ -479,10 +466,7 @@ def select_diverse_solutions(
         candidate = dict(sol)
         if any(_principle_key(candidate) == _principle_key(s) for s in selected):
             continue
-        if any(
-            _mechanism_cluster_hits(candidate) & _mechanism_cluster_hits(s)
-            for s in selected
-        ):
+        if any(_mechanism_cluster_hits(candidate) & _mechanism_cluster_hits(s) for s in selected):
             continue
         trial = selected + [candidate]
         if len(trial) >= 3:
@@ -501,10 +485,7 @@ def select_diverse_solutions(
         candidate = dict(sol)
         if any(_principle_key(candidate) == _principle_key(s) for s in selected):
             continue
-        if any(
-            _mechanism_cluster_hits(candidate) & _mechanism_cluster_hits(s)
-            for s in selected
-        ):
+        if any(_mechanism_cluster_hits(candidate) & _mechanism_cluster_hits(s) for s in selected):
             continue
         selected.append(candidate)
         seen.add(key)
@@ -534,9 +515,7 @@ def _solution_text(solution: dict) -> str:
     return " ".join(str(p) for p in parts if p).lower()
 
 
-def _heuristic_constraint_violation(
-    solution: dict, constraints_text: str
-) -> tuple[bool, str, str]:
+def _heuristic_constraint_violation(solution: dict, constraints_text: str) -> tuple[bool, str, str]:
     """Дешёвая эвристика явных и типовых косвенных нарушений constraints без LLM."""
     if not constraints_text.strip():
         return False, "", ""
@@ -558,9 +537,7 @@ def _heuristic_constraint_violation(
                     ),
                 )
 
-    material_forbidden = any(
-        m in constraints_lower for m in _MATERIAL_CHANGE_FORBIDDEN_MARKERS
-    )
+    material_forbidden = any(m in constraints_lower for m in _MATERIAL_CHANGE_FORBIDDEN_MARKERS)
     if material_forbidden and any(m in text for m in _NEW_PRODUCT_MARKERS):
         for marker in _MATERIAL_CHANGE_FORBIDDEN_MARKERS:
             if marker in constraints_lower:
@@ -730,20 +707,14 @@ def _build_feedback_from_items(
     lines: list[str] = []
 
     for item in items:
-        if (
-            item.not_dead_end_duplicate
-            and item.uses_specific_resource
-            and item.advances_ifr
-        ):
+        if item.not_dead_end_duplicate and item.uses_specific_resource and item.advances_ifr:
             continue
 
         sol = by_id.get(item.solution_id, {})
         title = sol.get("title", f"id={item.solution_id}")
         violations: list[str] = []
         if not item.not_dead_end_duplicate:
-            violations.append(
-                "дублирует тупик из known_solutions/why_failed (семантически)"
-            )
+            violations.append("дублирует тупик из known_solutions/why_failed (семантически)")
         if not item.uses_specific_resource:
             violations.append("не опирается на конкретный ресурс из resources")
         if not item.advances_ifr:
@@ -769,11 +740,7 @@ def _count_quality_passed(
         item = by_id.get(int(sid))
         if not item:
             continue
-        if (
-            item.not_dead_end_duplicate
-            and item.uses_specific_resource
-            and item.advances_ifr
-        ):
+        if item.not_dead_end_duplicate and item.uses_specific_resource and item.advances_ifr:
             passed_items.append(item)
     return len(passed_items), passed_items
 
@@ -803,15 +770,11 @@ def validate_solutions(
 
     ok, precheck_feedback = _heuristic_precheck(solutions)
     if not ok:
-        combined = "\n\n".join(
-            part for part in (constraint_feedback, precheck_feedback) if part
-        )
+        combined = "\n\n".join(part for part in (constraint_feedback, precheck_feedback) if part)
         return False, combined, solutions
 
     try:
-        result = _llm_checklist(
-            solutions, known_solutions, why_failed, resources, ifr, llm
-        )
+        result = _llm_checklist(solutions, known_solutions, why_failed, resources, ifr, llm)
         if isinstance(result, dict):
             result = _SolutionChecklistResult.model_validate(result)
     except Exception as exc:
@@ -852,18 +815,12 @@ def validate_solutions(
         return False, combined, solutions
 
     if not quality_passed:
-        combined = "\n\n".join(
-            part for part in (constraint_feedback, quality_feedback) if part
-        )
+        combined = "\n\n".join(part for part in (constraint_feedback, quality_feedback) if part)
         return False, combined, solutions
 
-    diversity_ok, diversity_feedback = check_solution_diversity(
-        solutions, resources, llm
-    )
+    diversity_ok, diversity_feedback = check_solution_diversity(solutions, resources, llm)
     if not diversity_ok:
-        combined = "\n\n".join(
-            part for part in (constraint_feedback, diversity_feedback) if part
-        )
+        combined = "\n\n".join(part for part in (constraint_feedback, diversity_feedback) if part)
         return False, combined, solutions
 
     return True, constraint_feedback, solutions

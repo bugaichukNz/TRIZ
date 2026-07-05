@@ -7,3 +7,10 @@
 *.env
 data/sessions/*.db
 triz-assistant/data/sessions/*.db
+triz-assistant/data/triz_corpus/.build_state.json
+triz-assistant/data/triz_corpus/*.bak
+triz-assistant/data/sessions/*.json
+triz-assistant/scripts/eval_out/
+triz-assistant/scripts/tromboz_*.txt
+triz-assistant/scripts/opto_*.txt
+triz-assistant/scripts/brief_*.txt

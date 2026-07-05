@@ -17,7 +17,6 @@ from backend.sessions_store import resolve_db_path
 logger = logging.getLogger(__name__)
 
 DEFAULT_USERNAME = "user"
-DEFAULT_PASSWORD = "user"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -35,9 +34,7 @@ def _now_iso() -> str:
 
 def hash_password(password: str) -> str:
     salt = secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000
-    )
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000)
     return f"{salt}${digest.hex()}"
 
 
@@ -46,9 +43,7 @@ def verify_password(password: str, stored_hash: str) -> bool:
         salt, expected = stored_hash.split("$", 1)
     except ValueError:
         return False
-    digest = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000
-    )
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000)
     return secrets.compare_digest(digest.hex(), expected)
 
 
@@ -68,7 +63,8 @@ class UserStore:
             return
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
-            self._seed_default_user(conn)
+            if settings.seed_default_user:
+                self._seed_default_user(conn)
             conn.commit()
         self._initialized = True
 
@@ -80,6 +76,14 @@ class UserStore:
         if row is not None:
             self._migrate_orphan_data(conn, row["id"])
             return
+        password = settings.default_user_password.strip()
+        if not password:
+            password = secrets.token_urlsafe(12)
+            logger.warning(
+                "DEFAULT_USER_PASSWORD не задан — сгенерирован одноразовый пароль для %s: %s",
+                DEFAULT_USERNAME,
+                password,
+            )
         user_id = str(uuid.uuid4())
         conn.execute(
             """
@@ -89,7 +93,7 @@ class UserStore:
             (
                 user_id,
                 DEFAULT_USERNAME,
-                hash_password(DEFAULT_PASSWORD),
+                hash_password(password),
                 _now_iso(),
             ),
         )
@@ -98,10 +102,7 @@ class UserStore:
 
     def _migrate_orphan_data(self, conn: sqlite3.Connection, user_id: str) -> None:
         tables = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
 
         def _has_column(table: str, column: str) -> bool:

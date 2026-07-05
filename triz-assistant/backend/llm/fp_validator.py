@@ -11,9 +11,13 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 _BILATERAL_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"долж(?:ен|на|но)\s+быть\s+.+?\s+и\s+долж(?:ен|на|но)\s+быть", re.IGNORECASE | re.DOTALL),
+    re.compile(
+        r"долж(?:ен|на|но)\s+быть\s+.+?\s+и\s+долж(?:ен|на|но)\s+быть", re.IGNORECASE | re.DOTALL
+    ),
     re.compile(r"должен\s+.{3,120}?\s+и\s+должен", re.IGNORECASE | re.DOTALL),
-    re.compile(r"должен\s+быть\s+.+?\s+и\s+(?:при\s+этом\s+)?(?:быть\s+)?", re.IGNORECASE | re.DOTALL),
+    re.compile(
+        r"должен\s+быть\s+.+?\s+и\s+(?:при\s+этом\s+)?(?:быть\s+)?", re.IGNORECASE | re.DOTALL
+    ),
     re.compile(r"с\s+одной\s+стороны.+с\s+другой", re.IGNORECASE | re.DOTALL),
     re.compile(r"одновременно\s+.{3,80}?\s+и\s+", re.IGNORECASE),
     re.compile(r"\bи\s+при\s+этом\b", re.IGNORECASE),
@@ -27,8 +31,12 @@ _SPATIAL_SPLIT_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bснизу\b.+\bсверху\b", re.IGNORECASE | re.DOTALL),
     re.compile(r"\bна\s+поднос\w*\b.+\bснаруж\w*\b", re.IGNORECASE | re.DOTALL),
     re.compile(r"\bснаруж\w*\b.+\bна\s+поднос\w*\b", re.IGNORECASE | re.DOTALL),
-    re.compile(r"\bвнешн\w*\s+поверхност\w*\b.+\bвнутренн\w*\s+поверхност\w*\b", re.IGNORECASE | re.DOTALL),
-    re.compile(r"\bвнутренн\w*\s+поверхност\w*\b.+\bвнешн\w*\s+поверхност\w*\b", re.IGNORECASE | re.DOTALL),
+    re.compile(
+        r"\bвнешн\w*\s+поверхност\w*\b.+\bвнутренн\w*\s+поверхност\w*\b", re.IGNORECASE | re.DOTALL
+    ),
+    re.compile(
+        r"\bвнутренн\w*\s+поверхност\w*\b.+\bвнешн\w*\s+поверхност\w*\b", re.IGNORECASE | re.DOTALL
+    ),
     re.compile(r"\bс\s+одной\s+стороны\b.+\bс\s+другой\s+стороны\b", re.IGNORECASE | re.DOTALL),
 ]
 
@@ -304,9 +312,7 @@ def _parse_fp_formula(fp_text: str) -> tuple[str, str, str, str, str, str] | Non
         return None
 
     lowered = text.lower()
-    has_antonyms = any(
-        stem_a in lowered and stem_b in lowered for stem_a, stem_b in _ANTONYM_PAIRS
-    )
+    has_antonyms = any(stem_a in lowered and stem_b in lowered for stem_a, stem_b in _ANTONYM_PAIRS)
     has_dual_clause = "должн" in lowered and " и должн" in lowered
     if not has_antonyms and not has_dual_clause:
         return None
@@ -484,9 +490,7 @@ def _llm_fp_values_desirability(
             continue
 
         if result.feedback.strip():
-            failed.append(
-                f"«{value}» — {result.feedback.strip()}"
-            )
+            failed.append(f"«{value}» — {result.feedback.strip()}")
         else:
             failed.append(
                 f"«{value}» параметра «{parameter}» само по себе нежелательно для системы"
@@ -634,17 +638,11 @@ def validate_fp(
 
     failed: list[str] = []
     if not result.single_parameter:
-        failed.append(
-            "не назван ровно один параметр/элемент системы"
-        )
+        failed.append("не назван ровно один параметр/элемент системы")
     if not result.dual_requirement:
-        failed.append(
-            "не заявлено, что элемент должен быть и X, и anti-X"
-        )
+        failed.append("не заявлено, что элемент должен быть и X, и anti-X")
     if not result.useful_functions_justified:
-        failed.append(
-            "не обоснованы отдельные полезные функции для X и anti-X"
-        )
+        failed.append("не обоснованы отдельные полезные функции для X и anti-X")
     if not result.both_values_inherently_desirable:
         failed.append(
             "одна из половин ФП — заведомо нежелательное значение параметра, "

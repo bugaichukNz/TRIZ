@@ -106,7 +106,7 @@ def build_report_html(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TRIZ Отчёт — {_esc(ts.strftime('%d.%m.%Y %H:%M'))}</title>
+<title>TRIZ Отчёт — {_esc(ts.strftime("%d.%m.%Y %H:%M"))}</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
 :root {{
@@ -212,15 +212,15 @@ li.empty {{ list-style: none; margin-left: -1.2rem; color: var(--text-secondary)
 <div class="wrap">
   <header>
     <h1>TRIZ-аналитический отчёт</h1>
-    <p class="meta">{_esc(ts.strftime('%d.%m.%Y %H:%M'))} · Экспертный анализ</p>
+    <p class="meta">{_esc(ts.strftime("%d.%m.%Y %H:%M"))} · Экспертный анализ</p>
     <p style="margin-top:0.75rem;font-size:0.9rem;">{_esc(problem)}</p>
   </header>
 
   <section>
     <h2>Описание задачи</h2>
-    <p>{_esc(result.get('problem_description', problem))}</p>
-    {'<h3>Принятые допущения</h3><ul>' + _list_items(result.get('assumptions') or []) + '</ul>' if result.get('assumptions') else ''}
-    <div class="executive" style="margin-top:1rem;"><strong>Резюме:</strong> {_esc(result.get('executive_summary', ''))}</div>
+    <p>{_esc(result.get("problem_description", problem))}</p>
+    {"<h3>Принятые допущения</h3><ul>" + _list_items(result.get("assumptions") or []) + "</ul>" if result.get("assumptions") else ""}
+    <div class="executive" style="margin-top:1rem;"><strong>Резюме:</strong> {_esc(result.get("executive_summary", ""))}</div>
   </section>
 
   <section>
@@ -231,19 +231,19 @@ li.empty {{ list-style: none; margin-left: -1.2rem; color: var(--text-secondary)
   <section>
     <h2>Противоречия и ИКР</h2>
     <table>
-      <tr><th>Техническое противоречие (ТП)</th><td>{_esc(result.get('technical_contradiction'))}</td></tr>
-      <tr><th>Физическое противоречие (ФП)</th><td>{_esc(result.get('physical_contradiction'))}</td></tr>
-      <tr><th>Тип</th><td>{_esc(result.get('contradiction_type'))}</td></tr>
+      <tr><th>Техническое противоречие (ТП)</th><td>{_esc(result.get("technical_contradiction"))}</td></tr>
+      <tr><th>Физическое противоречие (ФП)</th><td>{_esc(result.get("physical_contradiction"))}</td></tr>
+      <tr><th>Тип</th><td>{_esc(result.get("contradiction_type"))}</td></tr>
     </table>
-    <p class="ifr" style="margin-top:0.75rem;">ИКР: {_esc(result.get('ideal_final_result'))}</p>
+    <p class="ifr" style="margin-top:0.75rem;">ИКР: {_esc(result.get("ideal_final_result"))}</p>
   </section>
 
   <section>
     <h2>Анализ</h2>
-    <h3>Причинно-следственные цепочки</h3><p>{_esc(analysis.get('causal_chains'))}</p>
-    <h3>Функциональный анализ</h3><p>{_esc(analysis.get('functional_analysis'))}</p>
-    <h3>Выявленные ресурсы</h3><p>{_esc(analysis.get('resources_analysis'))}</p>
-    <h3>Ключевые зоны противоречий</h3><p>{_esc(analysis.get('contradiction_zones'))}</p>
+    <h3>Причинно-следственные цепочки</h3><p>{_esc(analysis.get("causal_chains"))}</p>
+    <h3>Функциональный анализ</h3><p>{_esc(analysis.get("functional_analysis"))}</p>
+    <h3>Выявленные ресурсы</h3><p>{_esc(analysis.get("resources_analysis"))}</p>
+    <h3>Ключевые зоны противоречий</h3><p>{_esc(analysis.get("contradiction_zones"))}</p>
   </section>
 
   <section>
@@ -274,24 +274,24 @@ li.empty {{ list-style: none; margin-left: -1.2rem; color: var(--text-secondary)
 
   <section>
     <h2>Рекомендации к внедрению</h2>
-    <h3>Приоритеты</h3><ul>{_list_items(rec.get('priorities') or [])}</ul>
-    <h3>Быстрые проверки</h3><ul>{_list_items(rec.get('quick_checks') or [])}</ul>
-    <h3>MVP / пилоты</h3><ul>{_list_items(rec.get('mvp_pilots') or [])}</ul>
-    <h3>Критические риски</h3><ul>{_list_items(rec.get('critical_risks') or [])}</ul>
-    <h3>Эксперименты</h3><ul>{_list_items(rec.get('experiments') or [])}</ul>
-    <h3>Метрики</h3><ul>{_list_items(rec.get('metrics') or [])}</ul>
+    <h3>Приоритеты</h3><ul>{_list_items(rec.get("priorities") or [])}</ul>
+    <h3>Быстрые проверки</h3><ul>{_list_items(rec.get("quick_checks") or [])}</ul>
+    <h3>MVP / пилоты</h3><ul>{_list_items(rec.get("mvp_pilots") or [])}</ul>
+    <h3>Критические риски</h3><ul>{_list_items(rec.get("critical_risks") or [])}</ul>
+    <h3>Эксперименты</h3><ul>{_list_items(rec.get("experiments") or [])}</ul>
+    <h3>Метрики</h3><ul>{_list_items(rec.get("metrics") or [])}</ul>
   </section>
 
   <section>
     <h2>Итоговый вывод</h2>
     <dl class="summary-grid">
-      <dt>Рекомендуемое решение</dt><dd>{_esc(conclusion.get('recommended_solution'))}</dd>
-      <dt>Ключевой риск</dt><dd>{_esc(conclusion.get('key_risk'))}</dd>
-      <dt>Следующий шаг</dt><dd>{_esc(conclusion.get('next_step'))}</dd>
+      <dt>Рекомендуемое решение</dt><dd>{_esc(conclusion.get("recommended_solution"))}</dd>
+      <dt>Ключевой риск</dt><dd>{_esc(conclusion.get("key_risk"))}</dd>
+      <dt>Следующий шаг</dt><dd>{_esc(conclusion.get("next_step"))}</dd>
     </dl>
   </section>
 
-  {'<section><h2>Применённые принципы TRIZ</h2><ul>' + _list_items(result.get('recommended_principles') or []) + '</ul></section>' if result.get('recommended_principles') else ''}
+  {"<section><h2>Применённые принципы TRIZ</h2><ul>" + _list_items(result.get("recommended_principles") or []) + "</ul></section>" if result.get("recommended_principles") else ""}
 
   <footer style="text-align:center;color:#6B6B6B;font-size:0.78rem;margin-top:2rem;">
     TRIZ AI-Ассистент · экспертный отчёт

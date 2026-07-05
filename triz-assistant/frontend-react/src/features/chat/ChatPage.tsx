@@ -22,12 +22,13 @@ import { useTheme } from '@mui/material/styles'
 import {
 
   filterVisibleMessages,
+  isAbortError,
   isSessionNotFoundError,
   trizApi,
 
-  useAnalyzeChatSessionMutation,
-
   useCreateChatSessionMutation,
+
+  useCreateSolveJobMutation,
 
   useDeleteChatSessionMutation,
 
@@ -39,7 +40,7 @@ import {
 
   useSendChatMessageMutation,
 
-  useLazyGetAnalyzeStatusQuery,
+  useLazyGetSolveJobStatusQuery,
 
   useSetActiveChatMutation,
 
@@ -60,6 +61,27 @@ import { getInterviewBlockStatus } from './interviewProgress'
 
 import { SessionsDrawer } from './SessionsDrawer'
 
+
+const SOLVE_JOB_KEY_PREFIX = 'triz-solve-job:'
+const SOLVE_JOB_POLL_MS = 2000
+
+function storedSolveJobId(sessionId: string): string | null {
+  return sessionStorage.getItem(`${SOLVE_JOB_KEY_PREFIX}${sessionId}`)
+}
+
+function storeSolveJobId(sessionId: string, jobId: string): void {
+  sessionStorage.setItem(`${SOLVE_JOB_KEY_PREFIX}${sessionId}`, jobId)
+}
+
+function clearStoredSolveJobId(sessionId: string): void {
+  sessionStorage.removeItem(`${SOLVE_JOB_KEY_PREFIX}${sessionId}`)
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms)
+  })
+}
 
 
 export function ChatPage() {
@@ -114,11 +136,27 @@ export function ChatPage() {
 
   const [sendMessage, { isLoading: sending }] = useSendChatMessageMutation()
 
-  const [analyze, { isLoading: analyzing }] = useAnalyzeChatSessionMutation()
-  const [fetchAnalyzeStatus] = useLazyGetAnalyzeStatusQuery()
+  const [createSolveJob] = useCreateSolveJobMutation()
+  const [fetchSolveJobStatus] = useLazyGetSolveJobStatusQuery()
 
+  const [analyzing, setAnalyzing] = useState(false)
   const [analyzeProgress, setAnalyzeProgress] = useState(0)
   const [analyzeStage, setAnalyzeStage] = useState('')
+  const resumeJobRef = useRef<string | null>(null)
+  const pollAbortControllerRef = useRef<AbortController | null>(null)
+
+  const beginPolling = useCallback(() => {
+    pollAbortControllerRef.current?.abort()
+    const controller = new AbortController()
+    pollAbortControllerRef.current = controller
+    return controller.signal
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      pollAbortControllerRef.current?.abort()
+    }
+  }, [])
 
   const [deleteSession] = useDeleteChatSessionMutation()
 
@@ -325,43 +363,151 @@ export function ChatPage() {
 
 
 
+  const finishSuccessfulJob = useCallback(
+    (sid: string, brief: string, result: import('../../types/triz').SolveResponse) => {
+      clearStoredSolveJobId(sid)
+      dispatch(
+        trizApi.util.invalidateTags([
+          { type: 'ChatSession', id: sid },
+          { type: 'ChatSessionList', id: 'LIST' },
+          { type: 'Report', id: sid },
+          { type: 'History', id: 'LIST' },
+        ]),
+      )
+      navigate(`/report/${sid}`, { state: { brief, result } })
+    },
+    [dispatch, navigate],
+  )
+
+  const pollSolveJob = useCallback(
+    async (jobId: string, sid: string, brief: string, signal: AbortSignal) => {
+      while (true) {
+        if (signal.aborted) return
+        await sleep(SOLVE_JOB_POLL_MS)
+        if (signal.aborted) return
+        try {
+          const status = await fetchSolveJobStatus({ jobId, signal }).unwrap()
+          if (signal.aborted) return
+          setAnalyzeProgress(status.progress.pct)
+          setAnalyzeStage(status.progress.stage)
+          if (status.status === 'done' && status.result) {
+            finishSuccessfulJob(sid, brief, status.result)
+            return
+          }
+          if (status.status === 'error') {
+            clearStoredSolveJobId(sid)
+            setSendError(status.error ?? 'Не удалось выполнить анализ')
+            return
+          }
+        } catch (err) {
+          if (isAbortError(err)) return
+          /* polling errors are non-fatal */
+        }
+      }
+    },
+    [fetchSolveJobStatus, finishSuccessfulJob],
+  )
+
   const runAnalysis = useCallback(
     async (options?: { force?: boolean }) => {
       if (!sessionId) return
 
+      const signal = beginPolling()
+
+      setAnalyzing(true)
       setAnalyzeProgress(0)
       setAnalyzeStage(options?.force ? 'Принудительное завершение анкеты…' : 'Запуск анализа…')
       setSendError(null)
 
-      const pollId = window.setInterval(async () => {
-        try {
-          const progress = await fetchAnalyzeStatus(sessionId).unwrap()
-          setAnalyzeProgress(progress.progress)
-          setAnalyzeStage(progress.stage)
-        } catch {
-          /* polling errors are non-fatal */
-        }
-      }, 600)
-
       try {
-        const result = await analyze(
-          options?.force ? { sessionId, force: true } : sessionId,
-        ).unwrap()
-        setAnalyzeProgress(100)
-        setAnalyzeStage('Готово')
-        navigate(`/report/${sessionId}`, { state: { brief: result.brief, result: result.result } })
+        const created = await createSolveJob({
+          problem: session?.brief ?? 'chat',
+          chat_session_id: sessionId,
+          force: options?.force ?? false,
+        }).unwrap()
+        if (signal.aborted) return
+        storeSolveJobId(sessionId, created.job_id)
+
+        const brief = session?.brief ?? ''
+        const status = await fetchSolveJobStatus({ jobId: created.job_id, signal }).unwrap()
+        if (signal.aborted) return
+        setAnalyzeProgress(status.progress.pct)
+        setAnalyzeStage(status.progress.stage)
+
+        if (status.status === 'done' && status.result) {
+          finishSuccessfulJob(sessionId, brief, status.result)
+          return
+        }
+        if (status.status === 'error') {
+          clearStoredSolveJobId(sessionId)
+          setSendError(status.error ?? 'Не удалось выполнить анализ')
+          return
+        }
+
+        await pollSolveJob(created.job_id, sessionId, brief, signal)
       } catch (err) {
+        if (isAbortError(err)) return
         const message =
           err && typeof err === 'object' && 'data' in err
             ? String((err as { data?: { detail?: string } }).data?.detail ?? 'Не удалось выполнить анализ')
             : 'Не удалось выполнить анализ'
         setSendError(message)
       } finally {
-        window.clearInterval(pollId)
+        if (!signal.aborted) {
+          setAnalyzing(false)
+        }
       }
     },
-    [sessionId, analyze, navigate, fetchAnalyzeStatus],
+    [sessionId, session?.brief, beginPolling, createSolveJob, fetchSolveJobStatus, pollSolveJob, finishSuccessfulJob],
   )
+
+  useEffect(() => {
+    if (!initDone || !sessionId || analyzing) return
+    const storedJobId = storedSolveJobId(sessionId)
+    if (!storedJobId) return
+    if (resumeJobRef.current === `${sessionId}:${storedJobId}`) return
+    resumeJobRef.current = `${sessionId}:${storedJobId}`
+
+    const resume = async () => {
+      const signal = beginPolling()
+      setAnalyzing(true)
+      const brief = session?.brief ?? ''
+      try {
+        const status = await fetchSolveJobStatus({ jobId: storedJobId, signal }).unwrap()
+        if (signal.aborted) return
+        setAnalyzeProgress(status.progress.pct)
+        setAnalyzeStage(status.progress.stage)
+        if (status.status === 'done' && status.result) {
+          finishSuccessfulJob(sessionId, brief, status.result)
+          return
+        }
+        if (status.status === 'error') {
+          clearStoredSolveJobId(sessionId)
+          setSendError(status.error ?? 'Не удалось выполнить анализ')
+          return
+        }
+        await pollSolveJob(storedJobId, sessionId, brief, signal)
+      } catch (err) {
+        if (isAbortError(err)) return
+        clearStoredSolveJobId(sessionId)
+      } finally {
+        if (!signal.aborted) {
+          setAnalyzing(false)
+        }
+      }
+    }
+
+    void resume()
+  }, [
+    initDone,
+    sessionId,
+    analyzing,
+    session?.brief,
+    beginPolling,
+    fetchSolveJobStatus,
+    pollSolveJob,
+    finishSuccessfulJob,
+  ])
 
   const handleAnalyze = useCallback(() => {
     void runAnalysis()

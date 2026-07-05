@@ -5,9 +5,9 @@ from __future__ import annotations
 import logging
 
 from backend.analysis_progress import analysis_progress
-from backend.chat_brief import compile_interview_brief
 from backend.chat_store import STATUS_ANALYZED, STATUS_INTERVIEW, STATUS_READY, ChatStore
 from backend.llm.chain import TRIZChain, TRIZChainError
+from backend.llm.interview_state import InterviewStateManager
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +56,10 @@ class ChatService:
             raise ChatServiceError("Сессия уже проанализирована.")
         return self._store.mark_ready(session_id)
 
-    def analyze(
+    def prepare_analyze(
         self, session_id: str, user_id: str, *, force: bool = False
-    ) -> tuple[dict, str]:
+    ) -> tuple[str, object]:
+        """Подготовка интервью к TRIZ-анализу: бриф и InterviewBrief."""
         session = self._store.get_session(session_id, user_id=user_id)
         if session is None:
             raise ChatServiceError("Сессия не найдена.")
@@ -77,26 +78,35 @@ class ChatService:
             session = self._store.mark_ready(session_id)
         elif session["status"] != STATUS_READY:
             if len(session["messages"]) < 3:
-                raise ChatServiceError(
-                    "Недостаточно данных для анализа. Продолжите интервью."
-                )
+                raise ChatServiceError("Недостаточно данных для анализа. Продолжите интервью.")
             session = self._store.mark_ready(session_id)
 
-        brief = session.get("brief") or compile_interview_brief(session["messages"])
-        if not brief.strip():
+        messages = session["messages"]
+        interview_brief = InterviewStateManager(messages).export_brief()
+        problem = session.get("brief") or interview_brief.to_prompt_text(messages)
+        if not problem.strip():
             raise ChatServiceError("Не удалось сформировать бриф интервью.")
 
-        logger.info("TRIZ analyze from chat session %s, brief_len=%d", session_id, len(brief))
+        return problem, interview_brief
+
+    def analyze(self, session_id: str, user_id: str, *, force: bool = False) -> tuple[dict, str]:
+        problem, interview_brief = self.prepare_analyze(session_id, user_id, force=force)
+
+        logger.info(
+            "TRIZ analyze from chat session %s, brief_len=%d",
+            session_id,
+            len(problem),
+        )
         analysis_progress.start(session_id)
 
         def on_progress(pct: int, stage: str) -> None:
             analysis_progress.update(session_id, pct, stage)
 
         try:
-            result = self._chain.solve(brief, on_progress=on_progress)
-            self._store.mark_analyzed(session_id, brief)
+            result = self._chain.solve(problem, brief=interview_brief, on_progress=on_progress)
+            self._store.mark_analyzed(session_id, problem)
             analysis_progress.complete(session_id)
-            return result, brief
+            return result, problem
         except TRIZChainError as exc:
             analysis_progress.fail(session_id, str(exc))
             raise

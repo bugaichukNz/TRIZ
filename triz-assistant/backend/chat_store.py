@@ -9,8 +9,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from backend.chat_brief import compile_interview_brief
 from backend.llm.chat_prompt import CHAT_OPENING_MESSAGE, READY_FOR_ANALYSIS_MARKER
+from backend.llm.interview_state import InterviewStateManager
 from backend.config import settings
 from backend.sessions_store import resolve_db_path
 
@@ -56,22 +56,16 @@ def _title_from_messages(messages: list[dict[str, str]]) -> str:
 
 def session_has_user_messages(messages: list[dict[str, str]]) -> bool:
     """Диалог считается начатым после первого сообщения пользователя."""
-    return any(
-        msg.get("role") == "user" and (msg.get("content") or "").strip()
-        for msg in messages
-    )
+    return any(msg.get("role") == "user" and (msg.get("content") or "").strip() for msg in messages)
 
 
 class ChatStore:
     """Сессии интервью TRIZ."""
 
     def __init__(self, db_path=None, max_sessions: int | None = None) -> None:
-        from pathlib import Path
 
         self.db_path = db_path or resolve_db_path()
-        self.max_sessions = (
-            max_sessions if max_sessions is not None else settings.chat_sessions_max
-        )
+        self.max_sessions = max_sessions if max_sessions is not None else settings.chat_sessions_max
 
     def _connect(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -98,16 +92,11 @@ class ChatStore:
 
     def _assign_orphan_user_ids(self, conn: sqlite3.Connection, table: str) -> None:
         tables = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
         if "users" not in tables:
             return
-        row = conn.execute(
-            "SELECT id FROM users ORDER BY created_at LIMIT 1"
-        ).fetchone()
+        row = conn.execute("SELECT id FROM users ORDER BY created_at LIMIT 1").fetchone()
         if row is None:
             return
         conn.execute(
@@ -360,7 +349,11 @@ class ChatStore:
         messages = list(session["messages"])
         messages.append({"role": "assistant", "content": cleaned})
         status = STATUS_READY if ready else session["status"]
-        brief = compile_interview_brief(messages) if ready else session.get("brief")
+        brief = (
+            InterviewStateManager(messages).export_brief().to_prompt_text(messages)
+            if ready
+            else session.get("brief")
+        )
         with self._connect() as conn:
             self._save_messages(
                 conn,
@@ -387,7 +380,7 @@ class ChatStore:
         if session is None:
             raise KeyError(f"Сессия не найдена: {session_id}")
         messages = session["messages"]
-        brief = compile_interview_brief(messages)
+        brief = InterviewStateManager(messages).export_brief().to_prompt_text(messages)
         with self._connect() as conn:
             self._save_messages(
                 conn,

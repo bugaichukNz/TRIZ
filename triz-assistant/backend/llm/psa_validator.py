@@ -20,6 +20,7 @@ _COMPONENT_STEM_MAP: list[tuple[re.Pattern[str], list[str]]] = [
     (re.compile(r"поднос", re.IGNORECASE), ["поднос"]),
 ]
 
+
 def _collect_source_texts(core: dict) -> list[str]:
     ctx = core.get("system_context") or {}
     constraints = ctx.get("constraints") or []

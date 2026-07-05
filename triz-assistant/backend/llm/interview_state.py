@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from backend.llm.models import InterviewBrief
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,7 @@ def _is_skip_answer(text: str) -> bool:
     t = text.strip().lower()
     return len(t) < 40 and any(m in t for m in _SKIP_MARKERS)
 
+
 _RETRY_HINTS: dict[str, str] = {
     "ne_when": (
         "Предыдущий ответ отклонён (тавтология). Переспроси с уточнением: "
@@ -39,9 +43,7 @@ _RETRY_HINTS: dict[str, str] = {
 }
 
 _TIME_ONLY = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?\s*$")
-_DATETIME_ONLY = re.compile(
-    r"^\d{1,2}\.\d{1,2}\.\d{4}\s+\d{1,2}:\d{2}(:\d{2})?\s*$"
-)
+_DATETIME_ONLY = re.compile(r"^\d{1,2}\.\d{1,2}\.\d{4}\s+\d{1,2}:\d{2}(:\d{2})?\s*$")
 
 BLOCKS: list[tuple[str, list[str]]] = [
     ("1 — НЭ", ["ne_fact", "ne_where", "ne_when", "consequences", "cause_hypothesis"]),
@@ -116,16 +118,14 @@ class InterviewStateManager:
 
     @staticmethod
     def _is_state_message(msg: dict[str, str]) -> bool:
-        return (
-            msg.get("role") == _STATE_ROLE
-            and (msg.get("content") or "").startswith(_STATE_PREFIX)
+        return msg.get("role") == _STATE_ROLE and (msg.get("content") or "").startswith(
+            _STATE_PREFIX
         )
 
     @staticmethod
     def _is_context_message(msg: dict[str, str]) -> bool:
-        return (
-            msg.get("role") == "assistant"
-            and (msg.get("content") or "").startswith(_CONTEXT_PREFIX)
+        return msg.get("role") == "assistant" and (msg.get("content") or "").startswith(
+            _CONTEXT_PREFIX
         )
 
     def _load(self, messages: list[dict[str, str]]) -> tuple[dict[str, Any], int]:
@@ -417,9 +417,7 @@ class InterviewStateManager:
                     field_key,
                     "Задай уточняющий переспрос по тому же полю.",
                 )
-                lines.append(
-                    f"[ИНСТРУКЦИЯ: переспрос поля «{field_label}». {retry_hint}]"
-                )
+                lines.append(f"[ИНСТРУКЦИЯ: переспрос поля «{field_label}». {retry_hint}]")
             else:
                 lines.append(
                     f"[ИНСТРУКЦИЯ: следующее поле для вопроса — «{field_label}». "
@@ -436,9 +434,7 @@ class InterviewStateManager:
 
     def _strip_ephemeral(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
         return [
-            m
-            for m in messages
-            if not self._is_state_message(m) and not self._is_context_message(m)
+            m for m in messages if not self._is_state_message(m) and not self._is_context_message(m)
         ]
 
     def _trim_dialog_tail(self, dialog: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -450,6 +446,26 @@ class InterviewStateManager:
         if opening and opening not in tail:
             return [opening, *tail]
         return tail
+
+    def export_brief(self) -> InterviewBrief:
+        """Собирает структурированный бриф из подтверждённых полей состояния."""
+        from backend.llm.models import InterviewBrief
+
+        confirmed = self._state.get("confirmed", {})
+        kwargs: dict[str, str] = {}
+        statuses: dict[str, str] = {}
+        for field in FIELD_LABELS:
+            if field in confirmed:
+                value = confirmed[field]
+                kwargs[field] = value
+                if (value or "").strip() == _SKIPPED_VALUE:
+                    statuses[field] = "skipped"
+                else:
+                    statuses[field] = "confirmed"
+            else:
+                kwargs[field] = _SKIPPED_VALUE
+                statuses[field] = "untouched"
+        return InterviewBrief(**kwargs, statuses=statuses)
 
     def build_payload_messages(
         self,

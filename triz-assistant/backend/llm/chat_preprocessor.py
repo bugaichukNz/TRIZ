@@ -123,9 +123,7 @@ def _is_tautology_ne_when(value: str, llm) -> bool:
     if heuristic is not None:
         return heuristic
     try:
-        response = llm.invoke(
-            [HumanMessage(content=_VALIDATE_NE_WHEN_PROMPT.format(value=value))]
-        )
+        response = llm.invoke([HumanMessage(content=_VALIDATE_NE_WHEN_PROMPT.format(value=value))])
         raw = response.content if hasattr(response, "content") else str(response)
         result = str(raw).strip().upper()
         return "ТАВТОЛОГИЯ" in result
@@ -185,25 +183,25 @@ def _build_context_message(known: dict) -> str:
         return ""
 
     FIELD_LABELS = {
-        "ne_fact":          "НЭ (факт)",
-        "ne_where":         "НЭ — где",
-        "ne_when":          "НЭ — когда",
-        "consequences":     "Последствия",
+        "ne_fact": "НЭ (факт)",
+        "ne_where": "НЭ — где",
+        "ne_when": "НЭ — когда",
+        "consequences": "Последствия",
         "cause_hypothesis": "Гипотеза причины (со слов задачедателя)",
-        "constraints":      "Ограничения",
-        "resources":        "Ресурсы",
-        "known_solutions":  "Известные решения/попытки",
-        "expected_result":  "Ожидаемый технический результат",
-        "economic_result":  "Ожидаемый экономический результат",
+        "constraints": "Ограничения",
+        "resources": "Ресурсы",
+        "known_solutions": "Известные решения/попытки",
+        "expected_result": "Ожидаемый технический результат",
+        "economic_result": "Ожидаемый экономический результат",
     }
 
     # Какие поля нужны для закрытия каждого блока
     BLOCK_REQUIRED = {
-        "1 — НЭ":                    ["ne_fact", "ne_where", "ne_when", "consequences", "cause_hypothesis"],
-        "2 — Система":               [],  # данных пока нет — блок открыт
-        "3 — Результаты":            ["expected_result", "economic_result"],
-        "4 — Ограничения/ресурсы":   ["constraints", "resources"],
-        "5 — Известные решения":     ["known_solutions"],
+        "1 — НЭ": ["ne_fact", "ne_where", "ne_when", "consequences", "cause_hypothesis"],
+        "2 — Система": [],  # данных пока нет — блок открыт
+        "3 — Результаты": ["expected_result", "economic_result"],
+        "4 — Ограничения/ресурсы": ["constraints", "resources"],
+        "5 — Известные решения": ["known_solutions"],
     }
 
     lines = ["[КОНТЕКСТ: данные, уже полученные от задачедателя]"]
@@ -257,7 +255,8 @@ def preprocess_chat_history(
 
     # Собираем текст только из user-сообщений
     user_text_parts = [
-        m["content"] for m in messages
+        m["content"]
+        for m in messages
         if m.get("role") == "user" and (m.get("content") or "").strip()
     ]
     if not user_text_parts:

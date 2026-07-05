@@ -99,25 +99,18 @@ class SessionsStore:
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(history_entries)")}
         if cols and "chat_session_id" not in cols:
-            conn.execute(
-                "ALTER TABLE history_entries ADD COLUMN chat_session_id TEXT"
-            )
+            conn.execute("ALTER TABLE history_entries ADD COLUMN chat_session_id TEXT")
         if cols and "user_id" not in cols:
             conn.execute("ALTER TABLE history_entries ADD COLUMN user_id TEXT")
             self._assign_orphan_user_ids(conn)
 
     def _assign_orphan_user_ids(self, conn: sqlite3.Connection) -> None:
         tables = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
         if "users" not in tables:
             return
-        row = conn.execute(
-            "SELECT id FROM users ORDER BY created_at LIMIT 1"
-        ).fetchone()
+        row = conn.execute("SELECT id FROM users ORDER BY created_at LIMIT 1").fetchone()
         if row is None:
             return
         conn.execute(

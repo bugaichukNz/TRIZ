@@ -23,6 +23,7 @@ except ImportError as exc:
         "Для DOCX установите зависимости: pip install python-docx matplotlib"
     ) from exc
 
+
 def _total_score(sol: dict[str, Any]) -> float:
     return round(
         sol.get("effectiveness_score", 0)
@@ -30,6 +31,7 @@ def _total_score(sol: dict[str, Any]) -> float:
         - (sol.get("complexity_score", 0) + sol.get("cost_score", 0)) / 2,
         1,
     )
+
 
 DARK_TEXT = RGBColor(0x1A, 0x1A, 0x1A)
 MID_TEXT = RGBColor(0x6B, 0x6B, 0x6B)
@@ -249,9 +251,7 @@ def build_report_docx(
     t_table = doc.add_table(rows=1, cols=4)
     t_table.style = "Table Grid"
     th = t_table.rows[0].cells
-    for i, h in enumerate(
-        ("Инструмент", "Почему применён", "Что выявил", "Практическая ценность")
-    ):
+    for i, h in enumerate(("Инструмент", "Почему применён", "Что выявил", "Практическая ценность")):
         th[i].text = h
     _style_header_row(t_table.rows[0], 4)
     for tool in tools:
