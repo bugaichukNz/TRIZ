@@ -99,4 +99,4 @@ def _isolate_settings(monkeypatch: pytest.MonkeyPatch) -> None:
         "jwt_secret",
         os.environ["JWT_SECRET"],
     )
-    monkeypatch.setattr(settings, "effects_rag_enabled", False)
+    monkeypatch.setattr(settings, "effects_rag_enabled", False)  # изоляция: дефолт True

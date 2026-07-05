@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pytest
@@ -282,3 +283,81 @@ class TestEffectsSolveResilience:
 
         payload = chain.solve(PROBLEM)
         assert payload.get("effects_used") == []
+
+
+class TestEffectsRagStartup:
+    def test_triz_chain_logs_disabled(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_llm,
+    ) -> None:
+        monkeypatch.setattr(settings, "openai_api_key", "test-key")
+        monkeypatch.setattr(settings, "effects_rag_enabled", False)
+        monkeypatch.setattr(
+            "backend.llm.chain.create_chat_llm",
+            lambda **_kw: fake_llm(),
+        )
+        with caplog.at_level(logging.INFO, logger="backend.llm.chain"):
+            TRIZChain()
+        assert "effects-RAG: выключен" in caplog.text
+
+    def test_triz_chain_logs_retriever_disabled(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_llm,
+    ) -> None:
+        monkeypatch.setattr(settings, "openai_api_key", "test-key")
+        monkeypatch.setattr(settings, "effects_rag_enabled", True)
+
+        class DisabledRetriever:
+            enabled = False
+
+        monkeypatch.setattr(
+            "backend.llm.chain.get_effects_retriever",
+            lambda: DisabledRetriever(),
+        )
+        monkeypatch.setattr(
+            "backend.llm.chain.create_chat_llm",
+            lambda **_kw: fake_llm(),
+        )
+        with caplog.at_level(logging.INFO, logger="backend.llm.chain"):
+            TRIZChain()
+        assert "effects-RAG: включён, retriever отключён" in caplog.text
+
+    def test_solve_works_when_retriever_disabled(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        chain_with_fake_llm: TRIZChain,
+    ) -> None:
+        monkeypatch.setattr(settings, "effects_rag_enabled", True)
+
+        class DisabledRetriever:
+            enabled = False
+
+            def search(self, *_args: Any, **_kwargs: Any) -> list[PhysicalEffect]:
+                return []
+
+        monkeypatch.setattr(
+            "backend.llm.chain.get_effects_retriever",
+            lambda: DisabledRetriever(),
+        )
+
+        chain = chain_with_fake_llm
+        chain._run_core_analysis = lambda _problem, brief=None: dict(CORE_FIXTURE)
+        chain._validate_and_fix_fp = lambda _problem, core, brief=None: core
+
+        def _pass_validation(*_args: Any, **_kwargs: Any) -> tuple[bool, str, list[dict]]:
+            batch = [s.model_dump() for s in SAMPLE_SOLUTIONS.solution_concepts]
+            return True, "", batch
+
+        monkeypatch.setattr("backend.llm.chain.validate_solutions", _pass_validation)
+        monkeypatch.setattr(
+            "backend.llm.chain.check_solution_diversity",
+            lambda *_a, **_k: (True, ""),
+        )
+
+        payload = chain.solve(PROBLEM)
+        assert payload.get("effects_used") == []
+        assert len(payload.get("solution_concepts", [])) == 3

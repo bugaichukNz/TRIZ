@@ -152,9 +152,22 @@ class TRIZChain:
                 settings.openai_base_url or "(default)",
                 "да" if settings.openai_proxy_url else "нет",
             )
+            self._log_effects_rag_status()
         except Exception as exc:
             logger.exception("Ошибка инициализации TRIZChain")
             raise TRIZChainError(f"Не удалось инициализировать LangChain: {exc}") from exc
+
+    @staticmethod
+    def _log_effects_rag_status() -> None:
+        """Однократный статус effects-RAG при создании TRIZChain."""
+        if not settings.effects_rag_enabled:
+            logger.info("effects-RAG: выключен")
+            return
+        retriever = get_effects_retriever()
+        if retriever.enabled:
+            logger.info("effects-RAG: включён, retriever готов")
+        else:
+            logger.info("effects-RAG: включён, retriever отключён")
 
     def chat(self, messages: list[dict[str, str]]) -> tuple[str, list[dict[str, str]]]:
         """Один ход диалогового интервью (текстовый ответ)."""

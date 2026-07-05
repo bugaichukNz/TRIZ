@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     jwt_secret: str
     seed_default_user: bool = False
     default_user_password: str = ""
-    effects_rag_enabled: bool = False
+    effects_rag_enabled: bool = True
     effects_score_threshold: float = 0.40
 
     @model_validator(mode="after")
