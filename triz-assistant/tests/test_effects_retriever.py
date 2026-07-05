@@ -167,7 +167,7 @@ class TestEffectsRetrieverSearch:
         retriever = EffectsRetriever(effects_path, index_path, meta_path)
         assert retriever.enabled
 
-        def _fake_embed(_client, texts: list[str]) -> np.ndarray:
+        def _fake_embed(texts: list[str]) -> np.ndarray:
             if len(texts) == 1 and "высокий" in texts[0].lower():
                 return np.array([[0.0, 1.0]], dtype=np.float32)
             return np.array([[1.0, 0.0]], dtype=np.float32)
@@ -193,7 +193,7 @@ class TestEffectsRetrieverSearch:
 
         monkeypatch.setattr(
             "backend.llm.effects_retriever.embed_texts",
-            lambda _c, _t: np.array([[0.0, 1.0]], dtype=np.float32),
+            lambda _t: np.array([[0.0, 1.0]], dtype=np.float32),
         )
         monkeypatch.setattr(settings, "effects_score_threshold", 0.9)
 
@@ -221,7 +221,7 @@ class TestEffectsRetrieverSearch:
         )
         retriever = EffectsRetriever(effects_path, index_path, meta_path)
 
-        def _fake_embed(_client, texts: list[str]) -> np.ndarray:
+        def _fake_embed(texts: list[str]) -> np.ndarray:
             return np.array([[0.0, 1.0, 0.0]], dtype=np.float32)
 
         monkeypatch.setattr("backend.llm.effects_retriever.embed_texts", _fake_embed)
@@ -260,7 +260,7 @@ class TestCalibrateRetriever:
             vector_kinds=["desc", "tasks", "desc", "tasks"],
         )
 
-        def _fake_embed(_client, texts: list[str]) -> np.ndarray:
+        def _fake_embed(texts: list[str]) -> np.ndarray:
             if any("нагреть" in text for text in texts):
                 return np.array([[0.0, 1.0, 0.0]], dtype=np.float32)
             return np.array([[0.0, 0.0, 1.0]], dtype=np.float32)

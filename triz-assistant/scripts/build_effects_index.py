@@ -21,7 +21,6 @@ from backend.llm.effects_retriever import (  # noqa: E402
     EMBED_BATCH_SIZE,
     build_embedding_text,
     build_tasks_embedding_text,
-    create_embeddings_client,
     embed_texts,
     index_meta_payload,
 )
@@ -80,12 +79,11 @@ def build_index(
     if len(texts) != len(ids) or len(texts) != len(kinds):
         raise RuntimeError("Internal error: texts/ids/kinds length mismatch")
 
-    client = create_embeddings_client()
     chunks: list[np.ndarray] = []
     for start in range(0, len(texts), batch_size):
         batch = texts[start : start + batch_size]
         logging.info("Embedding batch %d–%d / %d", start + 1, start + len(batch), len(texts))
-        chunks.append(embed_texts(client, batch))
+        chunks.append(embed_texts(batch))
 
     matrix = np.vstack(chunks).astype(np.float32, copy=False)
     if matrix.shape[0] != len(ids):

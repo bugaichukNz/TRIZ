@@ -44,6 +44,9 @@ def build_tasks_embedding_text(effect: PhysicalEffect) -> str:
     return f"{effect.name}. {phrases}"
 
 
+_client: OpenAI | None = None
+
+
 def create_embeddings_client() -> OpenAI:
     """OpenAI-клиент для embeddings с учётом base URL и прокси."""
     kwargs: dict = {"api_key": settings.openai_api_key}
@@ -60,12 +63,19 @@ def create_embeddings_client() -> OpenAI:
     return OpenAI(**kwargs)
 
 
-def embed_texts(client: OpenAI, texts: list[str]) -> np.ndarray:
+def _get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        _client = create_embeddings_client()
+    return _client
+
+
+def embed_texts(texts: list[str]) -> np.ndarray:
     """Эмбеддинги для списка текстов; возвращает L2-нормированную матрицу float32."""
     if not texts:
         return np.zeros((0, 0), dtype=np.float32)
 
-    response = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+    response = _get_client().embeddings.create(model=EMBEDDING_MODEL, input=texts)
     ordered = sorted(response.data, key=lambda item: item.index)
     matrix = np.array([item.embedding for item in ordered], dtype=np.float32)
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
@@ -198,8 +208,7 @@ class EffectsRetriever:
         if not cleaned:
             return {}
 
-        client = create_embeddings_client()
-        query_matrix = embed_texts(client, cleaned)
+        query_matrix = embed_texts(cleaned)
         scores = query_matrix @ self._matrix.T
 
         best_by_id: dict[str, float] = {}
