@@ -1,0 +1,7 @@
+{
+  "embedding_model": "text-embedding-3-small",
+  "corpus_version": "1.1.0",
+  "vector_count": 392,
+  "index_format": "multi_vector",
+  "built_at": "2026-07-05T13:22:08.247037+00:00"
+}

@@ -1,6 +1,52 @@
 """Pydantic-модели экспертного TRIZ-отчёта (structured output LLM)."""
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, computed_field
+
+_SKIPPED_VALUE = "—"
+FieldStatus = Literal["confirmed", "skipped", "untouched"]
+
+
+class InterviewBrief(BaseModel):
+    """Структурированный бриф интервью (17 полей FIELD_LABELS)."""
+
+    ne_fact: str = _SKIPPED_VALUE
+    ne_where: str = _SKIPPED_VALUE
+    ne_when: str = _SKIPPED_VALUE
+    consequences: str = _SKIPPED_VALUE
+    cause_hypothesis: str = _SKIPPED_VALUE
+    system_function: str = _SKIPPED_VALUE
+    system_elements: str = _SKIPPED_VALUE
+    system_object: str = _SKIPPED_VALUE
+    supersystem: str = _SKIPPED_VALUE
+    expected_result: str = _SKIPPED_VALUE
+    economic_result: str = _SKIPPED_VALUE
+    constraints: str = _SKIPPED_VALUE
+    resources: str = _SKIPPED_VALUE
+    known_solutions: str = _SKIPPED_VALUE
+    why_failed: str = _SKIPPED_VALUE
+    unrealized_ideas: str = _SKIPPED_VALUE
+    experts: str = _SKIPPED_VALUE
+    statuses: dict[str, FieldStatus] = Field(default_factory=dict)
+
+    def to_prompt_text(self, messages: list[dict[str, str]] | None = None) -> str:
+        """Текст брифа для LLM — тот же формат, что compile_interview_brief."""
+        from backend.chat_brief import _append_confirmed_sections, _append_dialog
+
+        confirmed: dict[str, str] = {}
+        for field, status in self.statuses.items():
+            if status in ("confirmed", "skipped"):
+                confirmed[field] = getattr(self, field)
+
+        lines = [
+            "# Сводка интервью TRIZ (подтверждена задачедателем)",
+            "",
+        ]
+        _append_confirmed_sections(lines, confirmed)
+        if messages:
+            _append_dialog(lines, messages)
+        return "\n".join(lines).strip()
 
 
 class SystemContext(BaseModel):
@@ -189,9 +235,7 @@ class TRIZAnalysisResult(BaseModel):
     recommended_principles: list[str] = Field(
         description="Применённые изобретательские принципы (№ и название)"
     )
-    executive_summary: str = Field(
-        description="Краткое резюме для руководства (3–5 предложений)"
-    )
+    executive_summary: str = Field(description="Краткое резюме для руководства (3–5 предложений)")
 
 
 def solution_total_score(solution: SolutionConcept | dict) -> float:
@@ -261,8 +305,7 @@ def build_recommendations(core: dict, solutions: list[dict]) -> dict:
             for sol in ranked[:2]
         ],
         mvp_pilots=[
-            f"Пилот #{sol['id']}: {sol.get('applicability', '')[:150]}"
-            for sol in ranked[:2]
+            f"Пилот #{sol['id']}: {sol.get('applicability', '')[:150]}" for sol in ranked[:2]
         ],
         critical_risks=critical_risks or ["Уточнить риски внедрения у ответственных экспертов"],
         experiments=[
@@ -283,8 +326,7 @@ def build_recommendations(core: dict, solutions: list[dict]) -> dict:
         ),
         key_risk=(best.get("risks") or ranked[0].get("risks") or "—")[:400],
         next_step=(
-            f"Запустить быструю проверку решения #{best_id}: "
-            f"{best.get('applicability', '')[:200]}"
+            f"Запустить быструю проверку решения #{best_id}: {best.get('applicability', '')[:200]}"
         ),
     )
 
@@ -304,6 +346,60 @@ def build_recommendations(core: dict, solutions: list[dict]) -> dict:
     }
 
 
+class PhysicalEffect(BaseModel):
+    """Физический, химический или геометрический эффект из указателя ТРИЗ."""
+
+    id: str = Field(description="Slug латиницей, напр. magnetostriction")
+    name: str = Field(description="Название на русском, напр. «Магнитострикция»")
+    category: Literal["физический", "химический", "геометрический"]
+    description: str = Field(description="2–4 предложения: суть эффекта")
+    input_action: str = Field(description="Что подаём на вход, напр. «магнитное поле»")
+    output_action: str = Field(description="Что получаем, напр. «изменение линейных размеров»")
+    functions: list[str] = Field(description="Обобщённые функции из контролируемого словаря EFFECT_FUNCTIONS")
+    limitations: str = Field(description="Границы применимости, типичные величины")
+    examples: list[str] = Field(description="1–3 примера применения в технике", min_length=1, max_length=3)
+    task_phrases: list[str] = Field(
+        default_factory=list,
+        description="Типовые инженерные задачи, решаемые эффектом (глагол + объект + условие)",
+    )
+    provenance: Literal["planned", "extra"] = Field(
+        default="planned",
+        description="planned — из suggested_ids батча; extra — сверх плана LLM",
+    )
+
+
+class EffectsCorpus(BaseModel):
+    """Контейнер корпуса физических эффектов для семантического поиска."""
+
+    effects: list[PhysicalEffect]
+    version: str = Field(description="Версия корпуса, напр. 1.0.0")
+
+
+class EffectsBatch(BaseModel):
+    """Пакет эффектов для батчевой генерации LLM (до 20 записей)."""
+
+    effects: list[PhysicalEffect] = Field(min_length=1, max_length=20)
+
+
+class EffectTaskPhrasesRow(BaseModel):
+    """Инженерные постановки задач для одного физэффекта."""
+
+    id: str
+    task_phrases: list[str] = Field(min_length=4, max_length=6)
+
+
+class EffectsTaskEnrichmentBatch(BaseModel):
+    """Батч обогащения task_phrases (до 20 эффектов)."""
+
+    effects: list[EffectTaskPhrasesRow] = Field(min_length=1, max_length=20)
+
+
+class EffectQueries(BaseModel):
+    """Поисковые запросы для RAG по корпусу физэффектов."""
+
+    queries: list[str] = Field(max_length=3)
+
+
 def enrich_legacy_fields(payload: dict) -> dict:
     """Добавляет поля обратной совместимости для старого UI/API."""
     payload["contradiction"] = payload.get("technical_contradiction", "")
@@ -314,9 +410,7 @@ def enrich_legacy_fields(payload: dict) -> dict:
     ]
     analysis = payload.get("analysis") or {}
     tools = payload.get("triz_tools") or []
-    tools_text = "; ".join(
-        t["tool"] if isinstance(t, dict) else t.tool for t in tools[:5]
-    )
+    tools_text = "; ".join(t["tool"] if isinstance(t, dict) else t.tool for t in tools[:5])
     payload["reasoning"] = (
         f"{payload.get('executive_summary', '')}\n\n"
         f"Инструменты: {tools_text}.\n"

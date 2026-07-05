@@ -65,6 +65,6 @@ SOLUTION_USER_PROMPT = """На основе завершённого TRIZ-ана
 
 Жёсткие ограничения (constraints) — нарушать НЕЛЬЗЯ; дорогие, но допустимые варианты допустимы:
 {constraints}
-{validator_feedback}
+{effects_block}{validator_feedback}
 Сформируй solution_concepts: 3–5 решений с полями id, title, triz_principle, mechanism, applicability, risks и оценками 1–10.
 """

@@ -7,18 +7,18 @@ from typing import Callable
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 
-from openai import (
-    APIConnectionError,
-    APIStatusError,
-    AuthenticationError,
-    RateLimitError,
-)
-
-from pydantic import ValidationError
-
 from backend.config import settings
+from backend.llm.errors import TRIZChainError, wrap_openai_errors
+from backend.llm.effects_query_prompt import (
+    EFFECT_QUERIES_SYSTEM_PROMPT,
+    EFFECT_QUERIES_USER_PROMPT,
+)
+from backend.llm.effects_rag import build_effects_block
+from backend.llm.effects_retriever import get_effects_retriever
 from backend.llm.models import (
     ContradictionRepair,
+    EffectQueries,
+    InterviewBrief,
     PSARootRepair,
     SolutionSet,
     TRIZAnalysisCore,
@@ -63,9 +63,7 @@ _MANDATORY_TOOL_MARKERS: dict[str, tuple[str, ...]] = {
 
 
 def _missing_mandatory_tools(result: dict) -> list[str]:
-    tools_text = " ".join(
-        (t.get("tool") or "").lower() for t in result.get("triz_tools", [])
-    )
+    tools_text = " ".join((t.get("tool") or "").lower() for t in result.get("triz_tools", []))
     return [
         name
         for name, markers in _MANDATORY_TOOL_MARKERS.items()
@@ -73,6 +71,7 @@ def _missing_mandatory_tools(result: dict) -> list[str]:
     ]
 
 
+# Legacy fallback: извлечение полей брифа из сырого текста (POST /solve без InterviewBrief).
 _BRIEF_FIELD_PATTERNS: dict[str, re.Pattern[str]] = {
     "known_solutions": re.compile(
         r"(?:^|\n)\s*[•\-]\s*(?:Известные попытки решения|Известные решения)"
@@ -90,18 +89,12 @@ _BRIEF_FIELD_PATTERNS: dict[str, re.Pattern[str]] = {
 }
 
 
-class TRIZChainError(Exception):
-    """Ошибка при работе TRIZ LLM-цепочки."""
-
-
 class TRIZChain:
     """LangChain-цепочка: задача → экспертный TRIZ-отчёт (пайплайн LLM-этапов)."""
 
     def __init__(self) -> None:
         if not settings.openai_api_key:
-            raise TRIZChainError(
-                "Не задан OPENAI_API_KEY. Укажите ключ в файле .env."
-            )
+            raise TRIZChainError("Не задан OPENAI_API_KEY. Укажите ключ в файле .env.")
 
         try:
             self._llm = create_chat_llm(temperature=0.25)
@@ -111,6 +104,15 @@ class TRIZChain:
             self._solution_llm = self._llm.with_structured_output(SolutionSet)
             self._fp_retry_llm = self._llm.with_structured_output(ContradictionRepair)
             self._psa_root_llm = self._llm.with_structured_output(PSARootRepair)
+            self._effect_queries_llm = self._llm.with_structured_output(EffectQueries)
+
+            self._effect_queries_prompt = ChatPromptTemplate.from_messages(
+                [
+                    ("system", EFFECT_QUERIES_SYSTEM_PROMPT),
+                    ("human", EFFECT_QUERIES_USER_PROMPT),
+                ]
+            )
+            self._effect_queries_chain = self._effect_queries_prompt | self._effect_queries_llm
 
             self._psa_root_prompt = ChatPromptTemplate.from_messages(
                 [
@@ -152,9 +154,7 @@ class TRIZChain:
             )
         except Exception as exc:
             logger.exception("Ошибка инициализации TRIZChain")
-            raise TRIZChainError(
-                f"Не удалось инициализировать LangChain: {exc}"
-            ) from exc
+            raise TRIZChainError(f"Не удалось инициализировать LangChain: {exc}") from exc
 
     def chat(self, messages: list[dict[str, str]]) -> tuple[str, list[dict[str, str]]]:
         """Один ход диалогового интервью (текстовый ответ)."""
@@ -200,25 +200,8 @@ class TRIZChain:
         if len(lc_messages) < 2:
             raise TRIZChainError("Нет сообщений для диалога.")
 
-        try:
+        with wrap_openai_errors("TRIZChain.chat"):
             response = self._chat_llm.invoke(lc_messages)
-        except RateLimitError as exc:
-            raise TRIZChainError(f"Rate limit: {exc}") from exc
-        except AuthenticationError as exc:
-            raise TRIZChainError(
-                "Неверный OPENAI_API_KEY. Обновите ключ в .env."
-            ) from exc
-        except APIConnectionError as exc:
-            raise TRIZChainError(
-                "Не удалось подключиться к OpenAI API. Проверьте сеть и прокси."
-            ) from exc
-        except APIStatusError as exc:
-            raise TRIZChainError(f"Ошибка OpenAI API: {exc.message}") from exc
-        except TRIZChainError:
-            raise
-        except Exception as exc:
-            logger.exception("Ошибка TRIZChain.chat")
-            raise TRIZChainError(f"Не удалось получить ответ модели: {exc}") from exc
 
         text = response.content if hasattr(response, "content") else str(response)
         if not text or not str(text).strip():
@@ -226,8 +209,13 @@ class TRIZChain:
         return str(text).strip(), updated_messages
 
     @staticmethod
+    def _brief_field_value(brief: InterviewBrief, field: str) -> str:
+        val = str(getattr(brief, field, "") or "").strip()
+        return val if val and val != "—" else "—"
+
+    @staticmethod
     def _extract_brief_attempt_history(problem: str) -> dict[str, str]:
-        """Извлекает тупики/попытки из сводки интервью (без подстановки всего брифа)."""
+        """Legacy fallback: извлекает тупики/попытки из сводки интервью (regex по тексту)."""
         fields: dict[str, str] = {}
         for key, pattern in _BRIEF_FIELD_PATTERNS.items():
             match = pattern.search(problem)
@@ -238,7 +226,17 @@ class TRIZChain:
         return fields
 
     @staticmethod
-    def _enrich_core_attempt_history(core: dict, problem: str) -> dict:
+    def _enrich_core_attempt_history(
+        core: dict,
+        problem: str,
+        brief: InterviewBrief | None = None,
+    ) -> dict:
+        if brief is not None:
+            for key in ("known_solutions", "why_failed", "unrealized_ideas"):
+                val = TRIZChain._brief_field_value(brief, key)
+                if val != "—" and not str(core.get(key) or "").strip():
+                    core[key] = val
+            return core
         brief_fields = TRIZChain._extract_brief_attempt_history(problem)
         for key in ("known_solutions", "why_failed", "unrealized_ideas"):
             if not str(core.get(key) or "").strip() and brief_fields.get(key):
@@ -246,15 +244,25 @@ class TRIZChain:
         return core
 
     @staticmethod
-    def _get_attempt_history(core: dict, problem: str) -> tuple[str, str, str]:
+    def _get_attempt_history(
+        core: dict,
+        problem: str,
+        brief: InterviewBrief | None = None,
+    ) -> tuple[str, str, str]:
+        if brief is not None:
+            return (
+                TRIZChain._brief_field_value(brief, "known_solutions"),
+                TRIZChain._brief_field_value(brief, "why_failed"),
+                TRIZChain._brief_field_value(brief, "unrealized_ideas"),
+            )
         known = str(core.get("known_solutions") or "").strip()
         why = str(core.get("why_failed") or "").strip()
         unrealized = str(core.get("unrealized_ideas") or "").strip()
         if not known or not why or not unrealized:
-            brief = TRIZChain._extract_brief_attempt_history(problem)
-            known = known or brief.get("known_solutions", "—")
-            why = why or brief.get("why_failed", "—")
-            unrealized = unrealized or brief.get("unrealized_ideas", "—")
+            legacy = TRIZChain._extract_brief_attempt_history(problem)
+            known = known or legacy.get("known_solutions", "—")
+            why = why or legacy.get("why_failed", "—")
+            unrealized = unrealized or legacy.get("unrealized_ideas", "—")
         return known or "—", why or "—", unrealized or "—"
 
     def _parse_core_result(self, result: object) -> dict:
@@ -262,56 +270,18 @@ class TRIZChain:
             return result.model_dump()
         if isinstance(result, dict):
             return TRIZAnalysisCore.model_validate(result).model_dump()
-        raise TRIZChainError(
-            f"Неожиданный тип ответа core-анализа: {type(result).__name__}"
-        )
+        raise TRIZChainError(f"Неожиданный тип ответа core-анализа: {type(result).__name__}")
 
-    def _run_core_analysis(self, problem: str) -> dict:
+    def _run_core_analysis(self, problem: str, brief: InterviewBrief | None = None) -> dict:
         """Этап a: core-анализ → TRIZAnalysisCore."""
-        try:
+        with wrap_openai_errors("core-анализа TRIZChain.solve"):
             result = self._core_chain.invoke({"problem": problem})
-        except RateLimitError as exc:
-            logger.error("Превышен лимит OpenAI: %s", exc)
-            raise TRIZChainError(
-                "Превышен лимит запросов OpenAI. Повторите попытку позже."
-            ) from exc
-        except AuthenticationError as exc:
-            logger.error("Неверный OPENAI_API_KEY: %s", exc)
-            raise TRIZChainError(
-                "Неверный OPENAI_API_KEY. Создайте новый ключ на "
-                "https://platform.openai.com/api-keys и обновите .env."
-            ) from exc
-        except APIConnectionError as exc:
-            logger.error("Нет соединения с OpenAI: %s", exc)
-            detail = str(exc).lower()
-            if "timed out" in detail or "timeout" in detail:
-                raise TRIZChainError(
-                    "Таймаут при обращении к OpenAI API. Проверьте прокси "
-                    "(OPENAI_PROXY_URL) или увеличьте таймаут; без прокси доступ "
-                    "может быть заблокирован."
-                ) from exc
-            raise TRIZChainError(
-                "Не удалось подключиться к OpenAI API. Проверьте сеть и прокси."
-            ) from exc
-        except APIStatusError as exc:
-            logger.error("Ошибка OpenAI API (статус %s): %s", exc.status_code, exc)
-            raise TRIZChainError(f"Ошибка OpenAI API: {exc.message}") from exc
-        except ValidationError as exc:
-            logger.error("Ошибка валидации core-ответа модели: %s", exc)
-            raise TRIZChainError(
-                f"Модель вернула некорректную структуру анализа: {exc}"
-            ) from exc
-        except TRIZChainError:
-            raise
-        except Exception as exc:
-            logger.exception("Ошибка core-анализа TRIZChain.solve")
-            raise TRIZChainError(f"Не удалось получить ответ модели: {exc}") from exc
 
-        return self._enrich_core_attempt_history(
-            self._parse_core_result(result), problem
-        )
+        return self._enrich_core_attempt_history(self._parse_core_result(result), problem, brief)
 
-    def _validate_and_fix_fp(self, problem: str, core: dict) -> dict:
+    def _validate_and_fix_fp(
+        self, problem: str, core: dict, brief: InterviewBrief | None = None
+    ) -> dict:
         """Этап b: валидация ПСА и ФП; при провале — до двух retry ПСА + ТП/ФП."""
         max_repairs = 2
 
@@ -356,7 +326,9 @@ class TRIZChain:
                     psa_ok, _ = validate_root_cause_not_crutch(core)
 
                 if not fp_passed or not psa_ok:
-                    repaired = self._regenerate_contradictions(problem, core, combined_feedback)
+                    repaired = self._regenerate_contradictions(
+                        problem, core, combined_feedback, brief=brief
+                    )
                     core["root_cause"] = repaired["root_cause"]
                     analysis = dict(core.get("analysis") or {})
                     analysis["causal_chains"] = repaired["causal_chains"]
@@ -383,26 +355,66 @@ class TRIZChain:
             return [str(raw).strip()]
         return []
 
+    def _retrieve_effects_for_solutions(self, core: dict) -> tuple[str, list[str]]:
+        """Подбор релевантных физэффектов для промпта генерации решений."""
+        if not settings.effects_rag_enabled:
+            return "", []
+
+        try:
+            result = self._effect_queries_chain.invoke(
+                {
+                    "physical_contradiction": core.get("physical_contradiction", ""),
+                    "ideal_final_result": core.get("ideal_final_result", ""),
+                    "root_cause": core.get("root_cause", ""),
+                }
+            )
+            if isinstance(result, EffectQueries):
+                queries = result.queries
+            elif isinstance(result, dict):
+                queries = EffectQueries.model_validate(result).queries
+            else:
+                raise TRIZChainError(
+                    f"Неожиданный тип ответа EffectQueries: {type(result).__name__}"
+                )
+
+            retriever = get_effects_retriever()
+            effects = retriever.search(queries, top_k=6)
+            return build_effects_block(effects)
+        except Exception as exc:
+            logger.warning(
+                "Этап подбора физэффектов пропущен из-за ошибки: %s",
+                exc,
+                exc_info=True,
+            )
+            return "", []
+
     def _build_solution_input(
         self,
         core: dict,
         problem: str,
         validator_feedback: str = "",
+        brief: InterviewBrief | None = None,
+        *,
+        effects_block: str = "",
     ) -> dict:
         analysis = core.get("analysis") or {}
         constraints = self._get_constraints(core)
-        constraints_text = (
-            "\n".join(f"• {c}" for c in constraints) if constraints else "—"
-        )
-        known, why_failed, unrealized = self._get_attempt_history(core, problem)
+        constraints_text = "\n".join(f"• {c}" for c in constraints) if constraints else "—"
+        if brief is not None:
+            brief_constraints = self._brief_field_value(brief, "constraints")
+            if brief_constraints != "—":
+                constraints_text = brief_constraints
+        known, why_failed, unrealized = self._get_attempt_history(core, problem, brief)
         ctx = core.get("system_context") or {}
         resources_list = ctx.get("resources") or []
         if isinstance(resources_list, list):
-            brief_resources = (
-                "\n".join(f"• {r}" for r in resources_list if str(r).strip()) or "—"
-            )
+            brief_resources = "\n".join(f"• {r}" for r in resources_list if str(r).strip()) or "—"
         else:
             brief_resources = str(resources_list).strip() or "—"
+        if brief is not None:
+            brief_resources_val = self._brief_field_value(brief, "resources")
+            if brief_resources_val != "—":
+                brief_resources = brief_resources_val
         feedback_block = ""
         if validator_feedback.strip():
             feedback_block = (
@@ -419,6 +431,7 @@ class TRIZChain:
             "why_failed": why_failed,
             "unrealized_ideas": unrealized,
             "constraints": constraints_text,
+            "effects_block": effects_block,
             "validator_feedback": feedback_block,
         }
 
@@ -428,22 +441,31 @@ class TRIZChain:
         problem: str,
         *,
         validator_feedback: str = "",
+        brief: InterviewBrief | None = None,
+        effects_block: str = "",
     ) -> list[dict]:
         """Генерация solution_concepts по валидированному ядру."""
         solution_input = self._build_solution_input(
-            core, problem, validator_feedback=validator_feedback
+            core,
+            problem,
+            validator_feedback=validator_feedback,
+            brief=brief,
+            effects_block=effects_block,
         )
         result = self._solution_chain.invoke(solution_input)
         if isinstance(result, SolutionSet):
             return [s.model_dump() for s in result.solution_concepts]
         if isinstance(result, dict):
             return SolutionSet.model_validate(result).model_dump()["solution_concepts"]
-        raise TRIZChainError(
-            f"Неожиданный тип ответа генерации решений: {type(result).__name__}"
-        )
+        raise TRIZChainError(f"Неожиданный тип ответа генерации решений: {type(result).__name__}")
 
     def _validate_and_generate_solutions(
-        self, core: dict, problem: str
+        self,
+        core: dict,
+        problem: str,
+        brief: InterviewBrief | None = None,
+        *,
+        effects_block: str = "",
     ) -> tuple[list[dict], str, int]:
         """
         Генерация решений + валидация с накоплением валидных попыток.
@@ -455,7 +477,7 @@ class TRIZChain:
         constraints = self._get_constraints(core)
         analysis = core.get("analysis") or {}
         resources = analysis.get("resources_analysis", "")
-        known, why_failed, _unrealized = self._get_attempt_history(core, problem)
+        known, why_failed, _unrealized = self._get_attempt_history(core, problem, brief)
         ifr = core.get("ideal_final_result", "")
 
         batches: list[list[dict]] = []
@@ -466,10 +488,16 @@ class TRIZChain:
             attempts_used = attempt
             try:
                 if attempt == 1:
-                    batch = self._generate_solutions(core, problem)
+                    batch = self._generate_solutions(
+                        core, problem, brief=brief, effects_block=effects_block
+                    )
                 else:
                     batch = self._generate_solutions(
-                        core, problem, validator_feedback=feedback
+                        core,
+                        problem,
+                        validator_feedback=feedback,
+                        brief=brief,
+                        effects_block=effects_block,
                     )
             except Exception as exc:
                 logger.warning(
@@ -484,9 +512,7 @@ class TRIZChain:
                 batch, known, why_failed, resources, ifr, self._llm, constraints
             )
             batches.append(valid_batch)
-            accumulated = select_diverse_solutions(
-                merge_valid_solutions(*batches), limit=5
-            )
+            accumulated = select_diverse_solutions(merge_valid_solutions(*batches), limit=5)
 
             logger.info(
                 "Solution generation attempt %d/%d: validation_passed=%s, "
@@ -500,9 +526,7 @@ class TRIZChain:
             )
 
             if len(accumulated) >= MIN_SOLUTIONS:
-                div_ok, div_feedback = check_solution_diversity(
-                    accumulated, resources, self._llm
-                )
+                div_ok, div_feedback = check_solution_diversity(accumulated, resources, self._llm)
                 if div_ok and passed:
                     return accumulated, "", attempts_used
                 if div_ok and attempt == MAX_SOLUTION_GENERATION_ATTEMPTS:
@@ -518,9 +542,7 @@ class TRIZChain:
             elif passed:
                 return accumulated, "", attempts_used
 
-        accumulated = select_diverse_solutions(
-            merge_valid_solutions(*batches), limit=5
-        )
+        accumulated = select_diverse_solutions(merge_valid_solutions(*batches), limit=5)
         if len(accumulated) >= MIN_SOLUTIONS:
             return accumulated, "", attempts_used
 
@@ -539,9 +561,7 @@ class TRIZChain:
             )
         return accumulated, warning, attempts_used
 
-    def _regenerate_psa_root(
-        self, problem: str, core: dict, feedback: str
-    ) -> dict[str, str]:
+    def _regenerate_psa_root(self, problem: str, core: dict, feedback: str) -> dict[str, str]:
         """Перегенерация только root_cause и causal_chains."""
         analysis = core.get("analysis") or {}
         ctx = core.get("system_context") or {}
@@ -564,12 +584,14 @@ class TRIZChain:
             return result.model_dump()
         if isinstance(result, dict):
             return PSARootRepair.model_validate(result).model_dump()
-        raise TRIZChainError(
-            f"Неожиданный тип ответа перегенерации ПСА: {type(result).__name__}"
-        )
+        raise TRIZChainError(f"Неожиданный тип ответа перегенерации ПСА: {type(result).__name__}")
 
     def _regenerate_contradictions(
-        self, problem: str, core: dict, feedback: str
+        self,
+        problem: str,
+        core: dict,
+        feedback: str,
+        brief: InterviewBrief | None = None,
     ) -> dict[str, str]:
         """Повторная генерация ПСА, ТП и ФП с учётом замечаний валидатора."""
         analysis = core.get("analysis") or {}
@@ -584,7 +606,14 @@ class TRIZChain:
             constraints = "\n".join(f"• {c}" for c in constraints_list if str(c).strip()) or "—"
         else:
             constraints = str(constraints_list).strip() or "—"
-        known, why_failed, unrealized = self._get_attempt_history(core, problem)
+        if brief is not None:
+            brief_constraints = self._brief_field_value(brief, "constraints")
+            if brief_constraints != "—":
+                constraints = brief_constraints
+            brief_resources_val = self._brief_field_value(brief, "resources")
+            if brief_resources_val != "—":
+                resources = brief_resources_val
+        known, why_failed, unrealized = self._get_attempt_history(core, problem, brief)
         result = self._fp_retry_chain.invoke(
             {
                 "problem": problem,
@@ -611,15 +640,27 @@ class TRIZChain:
             f"Неожиданный тип ответа перегенерации ПСА/ФП: {type(result).__name__}"
         )
 
-    def _assemble_payload(self, core: dict, solutions: list[dict]) -> dict:
+    def _assemble_payload(
+        self,
+        core: dict,
+        solutions: list[dict],
+        *,
+        effects_used: list[str] | None = None,
+    ) -> dict:
         """Этап d–e: рекомендации + финальный payload."""
         tail = build_recommendations(core, solutions)
-        return {**core, "solution_concepts": solutions, **tail}
+        return {
+            **core,
+            "solution_concepts": solutions,
+            "effects_used": list(effects_used or []),
+            **tail,
+        }
 
     def solve(
         self,
         problem: str,
         *,
+        brief: InterviewBrief | None = None,
         on_progress: Callable[[int, str], None] | None = None,
     ) -> dict:
         """
@@ -627,13 +668,15 @@ class TRIZChain:
 
         a) core-анализ (TRIZAnalysisCore)
         b) валидация ФП (+ retry ТП/ФП при провале)
-        c) генерация решений (+ валидация и retry)
-        d) рекомендации (детерминированно из ранжирования)
-        e) сборка payload + enrich_legacy_fields
+        c) подбор физэффектов (опционально, feature-flag)
+        d) генерация решений (+ валидация и retry)
+        e) рекомендации (детерминированно из ранжирования)
+        f) сборка payload + enrich_legacy_fields
 
         Returns:
             dict с полями полного отчёта и обратной совместимости.
         """
+
         def _progress(pct: int, stage: str) -> None:
             if on_progress is not None:
                 on_progress(pct, stage)
@@ -646,7 +689,7 @@ class TRIZChain:
 
         _progress(5, "Подготовка к анализу")
         _progress(10, "TRIZ core-анализ")
-        core = self._run_core_analysis(problem)
+        core = self._run_core_analysis(problem, brief)
         missing = _missing_mandatory_tools(core)
         if missing:
             logger.info(
@@ -658,7 +701,7 @@ class TRIZChain:
                 f"ШАГ 2.1: {', '.join(missing)}. Включи их в triz_tools с конкретными "
                 "результатами применения к данной задаче."
             )
-            core = self._run_core_analysis(problem + retry_note)
+            core = self._run_core_analysis(problem + retry_note, brief)
             still_missing = _missing_mandatory_tools(core)
             if still_missing:
                 logger.warning(
@@ -672,25 +715,26 @@ class TRIZChain:
         )
 
         _progress(35, "Валидация физического противоречия")
-        core = self._validate_and_fix_fp(problem, core)
+        core = self._validate_and_fix_fp(problem, core, brief)
         core, type_note = reconcile_contradiction_type(core)
         if type_note:
             logger.info("TRIZ contradiction_type reconciled: %s", type_note)
 
+        _progress(45, "Подбор физических эффектов")
+        effects_block, effects_used = self._retrieve_effects_for_solutions(core)
+
         _progress(50, "Генерация решений")
         solutions, generation_warning, _attempts = self._validate_and_generate_solutions(
-            core, problem
+            core, problem, brief, effects_block=effects_block
         )
 
         _progress(85, "Формирование рекомендаций")
-        payload = self._assemble_payload(core, solutions)
+        payload = self._assemble_payload(core, solutions, effects_used=effects_used)
         if generation_warning:
             payload["solution_generation_note"] = generation_warning
             summary = (payload.get("executive_summary") or "").strip()
             payload["executive_summary"] = (
-                f"{summary} {generation_warning}".strip()
-                if summary
-                else generation_warning
+                f"{summary} {generation_warning}".strip() if summary else generation_warning
             )
         payload = enrich_legacy_fields(payload)
 
