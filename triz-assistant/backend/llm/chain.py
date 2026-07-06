@@ -2,7 +2,8 @@
 
 import logging
 import re
-from typing import Callable
+import time
+from typing import Callable, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
@@ -19,6 +20,7 @@ from backend.llm.models import (
     ContradictionRepair,
     EffectQueries,
     InterviewBrief,
+    PipelineStepTrace,
     PSARootRepair,
     SolutionSet,
     TRIZAnalysisCore,
@@ -54,6 +56,86 @@ from backend.llm.solution_validator import (
 from backend.llm.system_prompt import CORE_SYSTEM_PROMPT, CORE_USER_PROMPT
 
 logger = logging.getLogger(__name__)
+
+_TRACE_NOTE_MAX = 200
+
+_PIPELINE_STEP_TITLES: dict[str, str] = {
+    "core_analysis": "Core-анализ",
+    "psa_fp_validation": "Валидация ПСА/ФП",
+    "effects_retrieval": "Подбор физэффектов",
+    "solution_generation": "Генерация решений",
+    "assembly": "Сборка рекомендаций",
+}
+
+
+def _truncate_trace_note(text: str, limit: int = _TRACE_NOTE_MAX) -> str:
+    cleaned = (text or "").strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 1].rstrip() + "…"
+
+
+def _step_status(
+    attempts: int,
+    *,
+    success: bool,
+    has_warning_notes: bool = False,
+) -> Literal["ok", "ok_with_retries", "warning"]:
+    if not success or has_warning_notes:
+        return "warning"
+    if attempts > 1:
+        return "ok_with_retries"
+    return "ok"
+
+
+def _extract_triz_tool_names(core: dict) -> list[str]:
+    names: list[str] = []
+    for row in core.get("triz_tools") or []:
+        if isinstance(row, dict):
+            name = (row.get("tool") or "").strip()
+        else:
+            name = (getattr(row, "tool", "") or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def _extract_solution_principles(solutions: list[dict]) -> list[str]:
+    principles: list[str] = []
+    seen: set[str] = set()
+    for sol in solutions:
+        principle = (sol.get("triz_principle") or "").strip()
+        if principle and principle not in seen:
+            seen.add(principle)
+            principles.append(principle)
+    return principles
+
+
+def _append_pipeline_step(
+    pipeline_trace: list[dict],
+    *,
+    step_id: str,
+    status: Literal["ok", "ok_with_retries", "warning"],
+    attempts: int,
+    tools_used: list[str],
+    validator_notes: list[str],
+    duration_ms: int,
+) -> None:
+    try:
+        pipeline_trace.append(
+            PipelineStepTrace(
+                step_id=step_id,
+                title=_PIPELINE_STEP_TITLES[step_id],
+                status=status,
+                attempts=attempts,
+                tools_used=tools_used,
+                validator_notes=validator_notes,
+                duration_ms=duration_ms,
+            ).model_dump()
+        )
+    except Exception as exc:
+        logger.warning("Не удалось записать pipeline_trace для %s: %s", step_id, exc)
+
 
 _MANDATORY_TOOL_MARKERS: dict[str, tuple[str, ...]] = {
     "Инструмент 2": ("инструмент 2", "постановка задачи"),
@@ -294,11 +376,14 @@ class TRIZChain:
 
     def _validate_and_fix_fp(
         self, problem: str, core: dict, brief: InterviewBrief | None = None
-    ) -> dict:
+    ) -> tuple[dict, int, list[str], bool]:
         """Этап b: валидация ПСА и ФП; при провале — до двух retry ПСА + ТП/ФП."""
         max_repairs = 2
+        validator_notes: list[str] = []
+        attempts_used = 0
 
         for attempt in range(1, max_repairs + 2):
+            attempts_used = attempt
             feedback_parts: list[str] = []
 
             psa_ok, psa_feedback = validate_psa_and_fp_alignment(core)
@@ -318,12 +403,14 @@ class TRIZChain:
             )
 
             if psa_ok and fp_passed:
-                return core
+                return core, attempts_used, validator_notes, True
 
             if not psa_ok and psa_feedback:
                 feedback_parts.append(psa_feedback)
+                validator_notes.append(_truncate_trace_note(psa_feedback))
             if not fp_passed and fp_feedback:
                 feedback_parts.append(fp_feedback)
+                validator_notes.append(_truncate_trace_note(fp_feedback))
 
             if attempt > max_repairs:
                 break
@@ -354,9 +441,10 @@ class TRIZChain:
                     attempt,
                     exc,
                 )
+                validator_notes.append(_truncate_trace_note(f"Ошибка перегенерации: {exc}"))
                 break
 
-        return core
+        return core, attempts_used, validator_notes, False
 
     @staticmethod
     def _get_constraints(core: dict) -> list[str]:
@@ -479,13 +567,13 @@ class TRIZChain:
         brief: InterviewBrief | None = None,
         *,
         effects_block: str = "",
-    ) -> tuple[list[dict], str, int]:
+    ) -> tuple[list[dict], str, int, list[str]]:
         """
         Генерация решений + валидация с накоплением валидных попыток.
 
         Returns:
-            (solutions, warning, attempts_used) — warning непустой, если после
-            MAX_SOLUTION_GENERATION_ATTEMPTS валидных решений меньше MIN_SOLUTIONS.
+            (solutions, warning, attempts_used, validator_notes) — warning непустой,
+            если после MAX_SOLUTION_GENERATION_ATTEMPTS валидных решений меньше MIN_SOLUTIONS.
         """
         constraints = self._get_constraints(core)
         analysis = core.get("analysis") or {}
@@ -496,6 +584,7 @@ class TRIZChain:
         batches: list[list[dict]] = []
         feedback = ""
         attempts_used = 0
+        validator_notes: list[str] = []
 
         for attempt in range(1, MAX_SOLUTION_GENERATION_ATTEMPTS + 1):
             attempts_used = attempt
@@ -519,11 +608,14 @@ class TRIZChain:
                     MAX_SOLUTION_GENERATION_ATTEMPTS,
                     exc,
                 )
+                validator_notes.append(_truncate_trace_note(f"Ошибка генерации: {exc}"))
                 break
 
             passed, feedback, valid_batch = validate_solutions(
                 batch, known, why_failed, resources, ifr, self._llm, constraints
             )
+            if feedback:
+                validator_notes.append(_truncate_trace_note(feedback))
             batches.append(valid_batch)
             accumulated = select_diverse_solutions(merge_valid_solutions(*batches), limit=5)
 
@@ -541,11 +633,13 @@ class TRIZChain:
             if len(accumulated) >= MIN_SOLUTIONS:
                 div_ok, div_feedback = check_solution_diversity(accumulated, resources, self._llm)
                 if div_ok and passed:
-                    return accumulated, "", attempts_used
+                    return accumulated, "", attempts_used, validator_notes
                 if div_ok and attempt == MAX_SOLUTION_GENERATION_ATTEMPTS:
-                    return accumulated, "", attempts_used
+                    return accumulated, "", attempts_used, validator_notes
                 if not div_ok:
                     feedback = div_feedback or feedback
+                    if div_feedback:
+                        validator_notes.append(_truncate_trace_note(div_feedback))
                     if attempt < MAX_SOLUTION_GENERATION_ATTEMPTS:
                         logger.info(
                             "Накопленный набор не прошёл проверку разнообразия, retry: %s",
@@ -553,11 +647,11 @@ class TRIZChain:
                         )
                         continue
             elif passed:
-                return accumulated, "", attempts_used
+                return accumulated, "", attempts_used, validator_notes
 
         accumulated = select_diverse_solutions(merge_valid_solutions(*batches), limit=5)
         if len(accumulated) >= MIN_SOLUTIONS:
-            return accumulated, "", attempts_used
+            return accumulated, "", attempts_used, validator_notes
 
         warning = PARTIAL_GENERATION_WARNING
         if not accumulated:
@@ -572,7 +666,8 @@ class TRIZChain:
                 len(accumulated),
                 MIN_SOLUTIONS,
             )
-        return accumulated, warning, attempts_used
+        validator_notes.append(_truncate_trace_note(warning))
+        return accumulated, warning, attempts_used, validator_notes
 
     def _regenerate_psa_root(self, problem: str, core: dict, feedback: str) -> dict[str, str]:
         """Перегенерация только root_cause и causal_chains."""
@@ -701,6 +796,15 @@ class TRIZChain:
         logger.info("TRIZ solve pipeline: длина задачи=%d", len(problem))
 
         _progress(5, "Подготовка к анализу")
+
+        pipeline_trace: list[dict] = []
+
+        # --- core_analysis ---
+        t0 = time.perf_counter()
+        core_attempts = 1
+        core_notes: list[str] = []
+        core_warning = False
+
         _progress(10, "TRIZ core-анализ")
         core = self._run_core_analysis(problem, brief)
         missing = _missing_mandatory_tools(core)
@@ -709,38 +813,111 @@ class TRIZChain:
                 "Обязательные инструменты ШАГ 2.1 отсутствуют после первого прохода: %s — повтор",
                 missing,
             )
+            core_notes.append(
+                _truncate_trace_note(
+                    f"Повтор core-анализа: отсутствовали {', '.join(missing)}"
+                )
+            )
             retry_note = (
                 "\n\nВАЖНО: в предыдущем анализе отсутствовали обязательные инструменты "
                 f"ШАГ 2.1: {', '.join(missing)}. Включи их в triz_tools с конкретными "
                 "результатами применения к данной задаче."
             )
             core = self._run_core_analysis(problem + retry_note, brief)
+            core_attempts = 2
             still_missing = _missing_mandatory_tools(core)
             if still_missing:
+                core_warning = True
                 logger.warning(
                     "Обязательные инструменты ШАГ 2.1 всё ещё отсутствуют после повтора: %s",
                     still_missing,
+                )
+                core_notes.append(
+                    _truncate_trace_note(
+                        f"После повтора отсутствуют: {', '.join(still_missing)}"
+                    )
                 )
         logger.info(
             "TRIZ core-анализ завершён: тип=%s, инструментов=%d",
             core.get("contradiction_type"),
             len(core.get("triz_tools", [])),
         )
+        _append_pipeline_step(
+            pipeline_trace,
+            step_id="core_analysis",
+            status=_step_status(
+                core_attempts,
+                success=not core_warning,
+                has_warning_notes=core_warning,
+            ),
+            attempts=core_attempts,
+            tools_used=_extract_triz_tool_names(core),
+            validator_notes=core_notes,
+            duration_ms=int((time.perf_counter() - t0) * 1000),
+        )
 
+        # --- psa_fp_validation ---
+        t0 = time.perf_counter()
         _progress(35, "Валидация физического противоречия")
-        core = self._validate_and_fix_fp(problem, core, brief)
+        core, fp_attempts, fp_notes, fp_ok = self._validate_and_fix_fp(problem, core, brief)
         core, type_note = reconcile_contradiction_type(core)
         if type_note:
             logger.info("TRIZ contradiction_type reconciled: %s", type_note)
-
-        _progress(45, "Подбор физических эффектов")
-        effects_block, effects_used = self._retrieve_effects_for_solutions(core)
-
-        _progress(50, "Генерация решений")
-        solutions, generation_warning, _attempts = self._validate_and_generate_solutions(
-            core, problem, brief, effects_block=effects_block
+            fp_notes.append(_truncate_trace_note(type_note))
+        _append_pipeline_step(
+            pipeline_trace,
+            step_id="psa_fp_validation",
+            status=_step_status(fp_attempts, success=fp_ok),
+            attempts=fp_attempts,
+            tools_used=[],
+            validator_notes=fp_notes,
+            duration_ms=int((time.perf_counter() - t0) * 1000),
         )
 
+        # --- effects_retrieval ---
+        t0 = time.perf_counter()
+        _progress(45, "Подбор физических эффектов")
+        if not settings.effects_rag_enabled:
+            effects_block, effects_used = "", []
+            effects_notes = ["отключён"]
+        else:
+            effects_block, effects_used = self._retrieve_effects_for_solutions(core)
+            effects_notes = []
+            if not effects_used:
+                effects_notes.append(
+                    _truncate_trace_note("Физэффекты не найдены или retriever недоступен")
+                )
+        _append_pipeline_step(
+            pipeline_trace,
+            step_id="effects_retrieval",
+            status="ok",
+            attempts=1,
+            tools_used=list(effects_used),
+            validator_notes=effects_notes,
+            duration_ms=int((time.perf_counter() - t0) * 1000),
+        )
+
+        # --- solution_generation ---
+        t0 = time.perf_counter()
+        _progress(50, "Генерация решений")
+        solutions, generation_warning, sol_attempts, sol_notes = (
+            self._validate_and_generate_solutions(
+                core, problem, brief, effects_block=effects_block
+            )
+        )
+        sol_ok = not generation_warning
+        _append_pipeline_step(
+            pipeline_trace,
+            step_id="solution_generation",
+            status=_step_status(sol_attempts, success=sol_ok),
+            attempts=sol_attempts,
+            tools_used=_extract_solution_principles(solutions),
+            validator_notes=sol_notes,
+            duration_ms=int((time.perf_counter() - t0) * 1000),
+        )
+
+        # --- assembly ---
+        t0 = time.perf_counter()
         _progress(85, "Формирование рекомендаций")
         payload = self._assemble_payload(core, solutions, effects_used=effects_used)
         if generation_warning:
@@ -750,6 +927,17 @@ class TRIZChain:
                 f"{summary} {generation_warning}".strip() if summary else generation_warning
             )
         payload = enrich_legacy_fields(payload)
+        _append_pipeline_step(
+            pipeline_trace,
+            step_id="assembly",
+            status="ok",
+            attempts=1,
+            tools_used=[],
+            validator_notes=[],
+            duration_ms=int((time.perf_counter() - t0) * 1000),
+        )
+
+        payload["pipeline_trace"] = pipeline_trace
 
         if len(payload.get("solution_concepts", [])) < 2:
             logger.warning(

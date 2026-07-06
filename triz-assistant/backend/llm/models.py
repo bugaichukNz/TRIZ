@@ -400,6 +400,21 @@ class EffectQueries(BaseModel):
     queries: list[str] = Field(max_length=3)
 
 
+PipelineStepStatus = Literal["ok", "ok_with_retries", "warning"]
+
+
+class PipelineStepTrace(BaseModel):
+    """Трассировка одного этапа пайплайна TRIZChain.solve."""
+
+    step_id: str
+    title: str
+    status: PipelineStepStatus
+    attempts: int
+    tools_used: list[str]
+    validator_notes: list[str]
+    duration_ms: int
+
+
 def enrich_legacy_fields(payload: dict) -> dict:
     """Добавляет поля обратной совместимости для старого UI/API."""
     payload["contradiction"] = payload.get("technical_contradiction", "")

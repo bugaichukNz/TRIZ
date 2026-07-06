@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, model_validator
 from backend.llm.models import (
     AnalysisBlock,
     FinalConclusionBlock,
+    PipelineStepTrace,
     RecommendationsBlock,
     SolutionConcept,
     SystemContext,
@@ -100,6 +101,11 @@ class SolveResponse(BaseModel):
     effects_used: list[str] = Field(
         default_factory=list,
         description="Имена физэффектов, подставленных в промпт генерации решений (A/B-метрики)",
+    )
+
+    pipeline_trace: list[PipelineStepTrace] = Field(
+        default_factory=list,
+        description="Трассировка этапов пайплайна (не включается в HTML/DOCX-отчёты)",
     )
 
 

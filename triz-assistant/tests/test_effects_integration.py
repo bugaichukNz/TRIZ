@@ -241,7 +241,7 @@ class TestEffectsSolveResilience:
 
         chain = chain_with_fake_llm
         chain._run_core_analysis = lambda _problem, brief=None: dict(CORE_FIXTURE)
-        chain._validate_and_fix_fp = lambda _problem, core, brief=None: core
+        chain._validate_and_fix_fp = lambda _problem, core, brief=None: (core, 1, [], True)
 
         def _pass_validation(*_args: Any, **_kwargs: Any) -> tuple[bool, str, list[dict]]:
             batch = [s.model_dump() for s in SAMPLE_SOLUTIONS.solution_concepts]
@@ -269,7 +269,7 @@ class TestEffectsSolveResilience:
 
         chain = chain_with_fake_llm
         chain._run_core_analysis = lambda _problem, brief=None: dict(CORE_FIXTURE)
-        chain._validate_and_fix_fp = lambda _problem, core, brief=None: core
+        chain._validate_and_fix_fp = lambda _problem, core, brief=None: (core, 1, [], True)
 
         def _pass_validation(*_args: Any, **_kwargs: Any) -> tuple[bool, str, list[dict]]:
             batch = [s.model_dump() for s in SAMPLE_SOLUTIONS.solution_concepts]
@@ -346,7 +346,7 @@ class TestEffectsRagStartup:
 
         chain = chain_with_fake_llm
         chain._run_core_analysis = lambda _problem, brief=None: dict(CORE_FIXTURE)
-        chain._validate_and_fix_fp = lambda _problem, core, brief=None: core
+        chain._validate_and_fix_fp = lambda _problem, core, brief=None: (core, 1, [], True)
 
         def _pass_validation(*_args: Any, **_kwargs: Any) -> tuple[bool, str, list[dict]]:
             batch = [s.model_dump() for s in SAMPLE_SOLUTIONS.solution_concepts]

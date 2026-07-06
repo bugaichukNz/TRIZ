@@ -54,6 +54,18 @@ export interface FinalConclusionBlock {
   next_step: string
 }
 
+export type PipelineStepStatus = 'ok' | 'ok_with_retries' | 'warning'
+
+export interface PipelineStepTrace {
+  step_id: string
+  title: string
+  status: PipelineStepStatus
+  attempts: number
+  tools_used: string[]
+  validator_notes: string[]
+  duration_ms: number
+}
+
 /** Полный TRIZ-отчёт (TRIZAnalysisResult / SolveResponse) */
 export interface TRIZAnalysisResult {
   problem_description: string
@@ -75,6 +87,8 @@ export interface TRIZAnalysisResult {
   contradiction?: string
   solutions?: string[]
   reasoning?: string
+  effects_used?: string[]
+  pipeline_trace?: PipelineStepTrace[]
 }
 
 export type ChatSessionStatus = 'interview' | 'ready' | 'analyzed'
