@@ -132,6 +132,44 @@ class ArtifactsStore:
             for row in rows
         ]
 
+    def load_all_with_metadata(
+        self, entry_id: str, *, user_id: str
+    ) -> dict[str, dict[str, Any]] | None:
+        """Payload и profile_hash артефактов entry; None если entry не найден или чужой."""
+        self._init_once()
+        with self._connect() as conn:
+            entry = conn.execute(
+                "SELECT id FROM history_entries WHERE id = ? AND user_id = ?",
+                (entry_id, user_id),
+            ).fetchone()
+            if entry is None:
+                return None
+            rows = conn.execute(
+                """
+                SELECT step_id, payload_json, profile_hash
+                FROM stage_artifacts
+                WHERE entry_id = ? AND user_id = ?
+                ORDER BY created_at ASC
+                """,
+                (entry_id, user_id),
+            ).fetchall()
+        return {
+            row["step_id"]: {
+                "payload": json.loads(row["payload_json"]),
+                "profile_hash": row["profile_hash"],
+            }
+            for row in rows
+        }
+
+    def load_all_payloads(
+        self, entry_id: str, *, user_id: str
+    ) -> dict[str, dict] | None:
+        """Все payload артефактов entry; None если entry не найден или чужой."""
+        loaded = self.load_all_with_metadata(entry_id, user_id=user_id)
+        if loaded is None:
+            return None
+        return {step_id: item["payload"] for step_id, item in loaded.items()}
+
     def get(
         self, entry_id: str, step_id: str, *, user_id: str
     ) -> StageArtifact | None:

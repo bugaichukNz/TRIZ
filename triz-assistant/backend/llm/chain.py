@@ -3,6 +3,7 @@
 import logging
 import re
 import time
+from dataclasses import dataclass, field
 from typing import Callable, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -69,6 +70,62 @@ _PIPELINE_STEP_TITLES: dict[str, str] = {
     "solution_generation": "Генерация решений",
     "assembly": "Сборка рекомендаций",
 }
+
+_RESUME_FROM_STEPS = frozenset(
+    {"psa_fp_validation", "effects_retrieval", "solution_generation", "assembly"}
+)
+
+_RESUME_REQUIRED_ARTIFACTS: dict[str, list[str]] = {
+    "psa_fp_validation": ["core_analysis"],
+    "effects_retrieval": ["core_analysis", "psa_fp_validation"],
+    "solution_generation": ["core_analysis", "psa_fp_validation", "effects_retrieval"],
+    "assembly": [
+        "core_analysis",
+        "psa_fp_validation",
+        "effects_retrieval",
+        "solution_generation",
+    ],
+}
+
+_RESTORED_TRACE_NOTE = "восстановлен из артефакта"
+
+_PSA_FP_OVERRIDE_FIELD_LABELS: dict[str, str] = {
+    "physical_contradiction": "physical_contradiction (ФП)",
+    "technical_contradiction": "technical_contradiction (ТП)",
+}
+
+
+def validate_psa_fp_override(overrides: dict[str, dict] | None) -> None:
+    """Проверяет переопределение psa_fp_validation: пустая строка в override — ошибка."""
+    if not overrides:
+        return
+    psa_override = overrides.get("psa_fp_validation")
+    if psa_override is None:
+        return
+    for key, label in _PSA_FP_OVERRIDE_FIELD_LABELS.items():
+        if key in psa_override and not str(psa_override.get(key) or "").strip():
+            raise TRIZChainError(f"В переопределённом артефакте пусто поле {label}.")
+
+
+@dataclass
+class _PipelineState:
+    core: dict
+    effects_block: str = ""
+    effects_used: list[str] = field(default_factory=list)
+    effects_queries: list[str] = field(default_factory=list)
+    solutions: list[dict] = field(default_factory=list)
+    generation_warning: str = ""
+
+
+@dataclass
+class _StepTrace:
+    step_id: str
+    status: Literal["ok", "ok_with_retries", "warning"]
+    attempts: int
+    tools_used: list[str]
+    validator_notes: list[str]
+    duration_ms: int
+    artifact: dict | None = None
 
 
 def _truncate_trace_note(text: str, limit: int = _TRACE_NOTE_MAX) -> str:
@@ -138,6 +195,41 @@ def _append_pipeline_step(
         )
     except Exception as exc:
         logger.warning("Не удалось записать pipeline_trace для %s: %s", step_id, exc)
+
+
+def _append_restored_pipeline_step(
+    pipeline_trace: list[dict],
+    *,
+    step_id: str,
+    tools_used: list[str] | None = None,
+) -> None:
+    _append_pipeline_step(
+        pipeline_trace,
+        step_id=step_id,
+        status="ok",
+        attempts=0,
+        tools_used=tools_used or [],
+        validator_notes=[_RESTORED_TRACE_NOTE],
+        duration_ms=0,
+    )
+
+
+def _record_step_trace(
+    pipeline_trace: list[dict],
+    trace: _StepTrace,
+    on_stage_complete: Callable[[str, dict], None] | None,
+) -> None:
+    _append_pipeline_step(
+        pipeline_trace,
+        step_id=trace.step_id,
+        status=trace.status,
+        attempts=trace.attempts,
+        tools_used=trace.tools_used,
+        validator_notes=trace.validator_notes,
+        duration_ms=trace.duration_ms,
+    )
+    if trace.artifact is not None:
+        _emit_stage_complete(on_stage_complete, trace.step_id, trace.artifact)
 
 
 def _psa_fp_snapshot(core: dict) -> dict:
@@ -826,45 +918,92 @@ class TRIZChain:
             **tail,
         }
 
-    def solve(
+    def _merge_psa_fp_artifact(self, core: dict, psa_snapshot: dict) -> dict:
+        """Накладывает снимок psa_fp_validation на core (без LLM-валидации)."""
+        merged = dict(core)
+        for key in (
+            "root_cause",
+            "technical_contradiction",
+            "physical_contradiction",
+            "contradiction_type",
+        ):
+            if key in psa_snapshot:
+                merged[key] = psa_snapshot[key]
+        if "causal_chains" in psa_snapshot:
+            analysis = dict(merged.get("analysis") or {})
+            analysis["causal_chains"] = psa_snapshot["causal_chains"]
+            merged["analysis"] = analysis
+        return merged
+
+    def _validate_resume_artifacts(self, from_step: str, artifacts: dict[str, dict]) -> None:
+        if from_step not in _RESUME_FROM_STEPS:
+            allowed = ", ".join(sorted(_RESUME_FROM_STEPS))
+            raise TRIZChainError(
+                f"Недопустимый from_step «{from_step}». "
+                f"Допустимые значения: {allowed}. "
+                "Для перезапуска с core_analysis используйте solve()."
+            )
+        required = _RESUME_REQUIRED_ARTIFACTS[from_step]
+        missing = [step_id for step_id in required if step_id not in artifacts]
+        if missing:
+            missing_titles = ", ".join(
+                f"«{_PIPELINE_STEP_TITLES[s]}» ({s})" for s in missing
+            )
+            raise TRIZChainError(
+                f"Для перезапуска с шага «{_PIPELINE_STEP_TITLES[from_step]}» "
+                f"не хватает артефактов: {missing_titles}."
+            )
+
+    def _build_state_from_artifacts(
+        self, artifacts: dict[str, dict], from_step: str
+    ) -> _PipelineState:
+        core = dict(artifacts["core_analysis"])
+        if from_step != "psa_fp_validation":
+            core = self._merge_psa_fp_artifact(core, artifacts["psa_fp_validation"])
+            core, _ = reconcile_contradiction_type(core)
+        state = _PipelineState(core=core)
+        if from_step in ("solution_generation", "assembly"):
+            effects_artifact = artifacts["effects_retrieval"]
+            state.effects_block = str(effects_artifact.get("effects_block") or "")
+            state.effects_used = list(effects_artifact.get("effects_used") or [])
+            state.effects_queries = list(effects_artifact.get("queries") or [])
+        if from_step == "assembly":
+            sol_artifact = artifacts["solution_generation"]
+            state.solutions = [
+                dict(s) for s in (sol_artifact.get("solutions") or [])
+            ]
+            state.generation_warning = str(sol_artifact.get("generation_warning") or "")
+        return state
+
+    def _append_restored_traces(
+        self,
+        pipeline_trace: list[dict],
+        from_step: str,
+        artifacts: dict[str, dict],
+    ) -> None:
+        for step_id in _RESUME_REQUIRED_ARTIFACTS[from_step]:
+            if step_id == "core_analysis":
+                core = artifacts["core_analysis"]
+                tools = _extract_triz_tool_names(core)
+            elif step_id == "effects_retrieval":
+                tools = list(artifacts["effects_retrieval"].get("effects_used") or [])
+            elif step_id == "solution_generation":
+                tools = _extract_solution_principles(
+                    artifacts["solution_generation"].get("solutions") or []
+                )
+            else:
+                tools = []
+            _append_restored_pipeline_step(
+                pipeline_trace, step_id=step_id, tools_used=tools
+            )
+
+    def _step_core(
         self,
         problem: str,
         *,
-        brief: InterviewBrief | None = None,
-        profile: AnalysisProfile | None = None,
-        on_progress: Callable[[int, str], None] | None = None,
-        on_stage_complete: Callable[[str, dict], None] | None = None,
-    ) -> dict:
-        """
-        Пайплайн TRIZ-анализа:
-
-        a) core-анализ (TRIZAnalysisCore)
-        b) валидация ФП (+ retry ТП/ФП при провале)
-        c) подбор физэффектов (опционально, feature-flag)
-        d) генерация решений (+ валидация и retry)
-        e) рекомендации (детерминированно из ранжирования)
-        f) сборка payload + enrich_legacy_fields
-
-        Returns:
-            dict с полями полного отчёта и обратной совместимости.
-        """
-
-        def _progress(pct: int, stage: str) -> None:
-            if on_progress is not None:
-                on_progress(pct, stage)
-
-        if not problem or not problem.strip():
-            raise TRIZChainError("Описание задачи (problem) не может быть пустым.")
-
-        problem = problem.strip()
-        resolved_profile = AnalysisProfile.resolve(profile)
-        logger.info("TRIZ solve pipeline: длина задачи=%d", len(problem))
-
-        _progress(5, "Подготовка к анализу")
-
-        pipeline_trace: list[dict] = []
-
-        # --- core_analysis ---
+        brief: InterviewBrief | None,
+        resolved_profile: AnalysisProfile,
+    ) -> tuple[_PipelineState, _StepTrace]:
         t0 = time.perf_counter()
         core_attempts = 1
         core_notes: list[str] = []
@@ -877,7 +1016,6 @@ class TRIZChain:
                 )
             )
 
-        _progress(10, "TRIZ core-анализ")
         core = self._run_core_analysis(problem, brief, profile=resolved_profile)
         missing = _missing_mandatory_tools(core, resolved_profile)
         if missing:
@@ -914,8 +1052,7 @@ class TRIZChain:
             core.get("contradiction_type"),
             len(core.get("triz_tools", [])),
         )
-        _append_pipeline_step(
-            pipeline_trace,
+        trace = _StepTrace(
             step_id="core_analysis",
             status=_step_status(
                 core_attempts,
@@ -926,24 +1063,33 @@ class TRIZChain:
             tools_used=_extract_triz_tool_names(core),
             validator_notes=core_notes,
             duration_ms=int((time.perf_counter() - t0) * 1000),
+            artifact=dict(core),
         )
-        _emit_stage_complete(on_stage_complete, "core_analysis", dict(core))
+        return _PipelineState(core=core), trace
 
-        # --- psa_fp_validation ---
+    def _step_validation(
+        self,
+        state: _PipelineState,
+        problem: str,
+        *,
+        brief: InterviewBrief | None,
+        resolved_profile: AnalysisProfile,
+    ) -> tuple[_PipelineState, _StepTrace]:
         t0 = time.perf_counter()
-        _progress(35, "Валидация физического противоречия")
+        core = state.core
         if not resolved_profile.psa_fp_validation:
             fp_attempts = 0
             fp_notes = ["отключено профилем"]
             fp_ok = False
         else:
-            core, fp_attempts, fp_notes, fp_ok = self._validate_and_fix_fp(problem, core, brief)
+            core, fp_attempts, fp_notes, fp_ok = self._validate_and_fix_fp(
+                problem, core, brief
+            )
         core, type_note = reconcile_contradiction_type(core)
         if type_note:
             logger.info("TRIZ contradiction_type reconciled: %s", type_note)
             fp_notes.append(_truncate_trace_note(type_note))
-        _append_pipeline_step(
-            pipeline_trace,
+        trace = _StepTrace(
             step_id="psa_fp_validation",
             status=(
                 "warning"
@@ -954,12 +1100,25 @@ class TRIZChain:
             tools_used=[],
             validator_notes=fp_notes,
             duration_ms=int((time.perf_counter() - t0) * 1000),
+            artifact=_psa_fp_snapshot(core),
         )
-        _emit_stage_complete(on_stage_complete, "psa_fp_validation", _psa_fp_snapshot(core))
+        return _PipelineState(
+            core=core,
+            effects_block=state.effects_block,
+            effects_used=state.effects_used,
+            effects_queries=state.effects_queries,
+            solutions=state.solutions,
+            generation_warning=state.generation_warning,
+        ), trace
 
-        # --- effects_retrieval ---
+    def _step_effects(
+        self,
+        state: _PipelineState,
+        *,
+        resolved_profile: AnalysisProfile,
+        profile: AnalysisProfile | None,
+    ) -> tuple[_PipelineState, _StepTrace]:
         t0 = time.perf_counter()
-        _progress(45, "Подбор физических эффектов")
         effects_queries: list[str] = []
         if not resolved_profile.effects_rag:
             effects_block, effects_used = "", []
@@ -969,98 +1128,259 @@ class TRIZChain:
                 effects_notes = ["отключён"]
         else:
             effects_block, effects_used, effects_queries = self._retrieve_effects_for_solutions(
-                core, profile=resolved_profile
+                state.core, profile=resolved_profile
             )
             effects_notes = []
             if not effects_used:
                 effects_notes.append(
                     _truncate_trace_note("Физэффекты не найдены или retriever недоступен")
                 )
-        _append_pipeline_step(
-            pipeline_trace,
+        trace = _StepTrace(
             step_id="effects_retrieval",
             status="ok",
             attempts=1,
             tools_used=list(effects_used),
             validator_notes=effects_notes,
             duration_ms=int((time.perf_counter() - t0) * 1000),
-        )
-        _emit_stage_complete(
-            on_stage_complete,
-            "effects_retrieval",
-            {
+            artifact={
                 "effects_block": effects_block,
                 "effects_used": list(effects_used),
                 "queries": list(effects_queries),
             },
         )
+        return _PipelineState(
+            core=state.core,
+            effects_block=effects_block,
+            effects_used=list(effects_used),
+            effects_queries=list(effects_queries),
+            solutions=state.solutions,
+            generation_warning=state.generation_warning,
+        ), trace
 
-        # --- solution_generation ---
+    def _step_solutions(
+        self,
+        state: _PipelineState,
+        problem: str,
+        *,
+        brief: InterviewBrief | None,
+        resolved_profile: AnalysisProfile,
+    ) -> tuple[_PipelineState, _StepTrace]:
         t0 = time.perf_counter()
-        _progress(50, "Генерация решений")
         solutions, generation_warning, sol_attempts, sol_notes = (
             self._validate_and_generate_solutions(
-                core,
+                state.core,
                 problem,
                 brief,
-                effects_block=effects_block,
+                effects_block=state.effects_block,
                 profile=resolved_profile,
             )
         )
         sol_ok = not generation_warning
-        _append_pipeline_step(
-            pipeline_trace,
+        trace = _StepTrace(
             step_id="solution_generation",
             status=_step_status(sol_attempts, success=sol_ok),
             attempts=sol_attempts,
             tools_used=_extract_solution_principles(solutions),
             validator_notes=sol_notes,
             duration_ms=int((time.perf_counter() - t0) * 1000),
-        )
-        _emit_stage_complete(
-            on_stage_complete,
-            "solution_generation",
-            {
+            artifact={
                 "solutions": [dict(s) if isinstance(s, dict) else s for s in solutions],
                 "generation_warning": generation_warning or "",
             },
         )
+        return _PipelineState(
+            core=state.core,
+            effects_block=state.effects_block,
+            effects_used=state.effects_used,
+            effects_queries=state.effects_queries,
+            solutions=solutions,
+            generation_warning=generation_warning,
+        ), trace
 
-        # --- assembly ---
+    def _step_assembly(
+        self,
+        state: _PipelineState,
+    ) -> tuple[dict, _StepTrace]:
         t0 = time.perf_counter()
-        _progress(85, "Формирование рекомендаций")
-        payload = self._assemble_payload(core, solutions, effects_used=effects_used)
-        if generation_warning:
-            payload["solution_generation_note"] = generation_warning
+        payload = self._assemble_payload(
+            state.core, state.solutions, effects_used=state.effects_used
+        )
+        if state.generation_warning:
+            payload["solution_generation_note"] = state.generation_warning
             summary = (payload.get("executive_summary") or "").strip()
             payload["executive_summary"] = (
-                f"{summary} {generation_warning}".strip() if summary else generation_warning
+                f"{summary} {state.generation_warning}".strip()
+                if summary
+                else state.generation_warning
             )
         payload = enrich_legacy_fields(payload)
-        _append_pipeline_step(
-            pipeline_trace,
+        trace = _StepTrace(
             step_id="assembly",
             status="ok",
             attempts=1,
             tools_used=[],
             validator_notes=[],
             duration_ms=int((time.perf_counter() - t0) * 1000),
+            artifact=None,
         )
+        return payload, trace
 
+    def _finalize_payload(
+        self,
+        payload: dict,
+        pipeline_trace: list[dict],
+        resolved_profile: AnalysisProfile,
+    ) -> dict:
         payload["pipeline_trace"] = pipeline_trace
         payload["analysis_profile"] = resolved_profile.model_dump()
-
         if len(payload.get("solution_concepts", [])) < 2:
             logger.warning(
                 "Сформировано менее 2 решений: %s",
                 payload.get("solution_concepts"),
             )
-
         logger.info(
             "TRIZ solve pipeline завершён: тип=%s, инструментов=%d, решений=%d",
             payload.get("contradiction_type"),
             len(payload.get("triz_tools", [])),
             len(payload.get("solution_concepts", [])),
         )
-        _progress(100, "Готово")
         return payload
+
+    def _run_pipeline(
+        self,
+        problem: str,
+        *,
+        brief: InterviewBrief | None = None,
+        profile: AnalysisProfile | None = None,
+        on_progress: Callable[[int, str], None] | None = None,
+        on_stage_complete: Callable[[str, dict], None] | None = None,
+        from_step: str = "core_analysis",
+        artifacts: dict[str, dict] | None = None,
+    ) -> dict:
+        def _progress(pct: int, stage: str) -> None:
+            if on_progress is not None:
+                on_progress(pct, stage)
+
+        resolved_profile = AnalysisProfile.resolve(profile)
+        pipeline_trace: list[dict] = []
+
+        if from_step == "core_analysis":
+            _progress(5, "Подготовка к анализу")
+            _progress(10, "TRIZ core-анализ")
+            state, trace = self._step_core(problem, brief=brief, resolved_profile=resolved_profile)
+            _record_step_trace(pipeline_trace, trace, on_stage_complete)
+            run_from = "psa_fp_validation"
+        else:
+            assert artifacts is not None
+            self._validate_resume_artifacts(from_step, artifacts)
+            _progress(5, "Подготовка к перезапуску")
+            self._append_restored_traces(pipeline_trace, from_step, artifacts)
+            state = self._build_state_from_artifacts(artifacts, from_step)
+            run_from = from_step
+
+        if run_from == "psa_fp_validation":
+            _progress(35, "Валидация физического противоречия")
+            state, trace = self._step_validation(
+                state, problem, brief=brief, resolved_profile=resolved_profile
+            )
+            _record_step_trace(pipeline_trace, trace, on_stage_complete)
+            run_from = "effects_retrieval"
+
+        if run_from == "effects_retrieval":
+            _progress(45, "Подбор физических эффектов")
+            state, trace = self._step_effects(
+                state, resolved_profile=resolved_profile, profile=profile
+            )
+            _record_step_trace(pipeline_trace, trace, on_stage_complete)
+            run_from = "solution_generation"
+
+        if run_from == "solution_generation":
+            _progress(50, "Генерация решений")
+            state, trace = self._step_solutions(
+                state, problem, brief=brief, resolved_profile=resolved_profile
+            )
+            _record_step_trace(pipeline_trace, trace, on_stage_complete)
+            run_from = "assembly"
+
+        if run_from == "assembly":
+            _progress(85, "Формирование рекомендаций")
+            payload, trace = self._step_assembly(state)
+            _record_step_trace(pipeline_trace, trace, on_stage_complete)
+
+        _progress(100, "Готово")
+        return self._finalize_payload(payload, pipeline_trace, resolved_profile)
+
+    def solve(
+        self,
+        problem: str,
+        *,
+        brief: InterviewBrief | None = None,
+        profile: AnalysisProfile | None = None,
+        on_progress: Callable[[int, str], None] | None = None,
+        on_stage_complete: Callable[[str, dict], None] | None = None,
+    ) -> dict:
+        """
+        Пайплайн TRIZ-анализа:
+
+        a) core-анализ (TRIZAnalysisCore)
+        b) валидация ФП (+ retry ТП/ФП при провале)
+        c) подбор физэффектов (опционально, feature-flag)
+        d) генерация решений (+ валидация и retry)
+        e) рекомендации (детерминированно из ранжирования)
+        f) сборка payload + enrich_legacy_fields
+
+        Returns:
+            dict с полями полного отчёта и обратной совместимости.
+        """
+        if not problem or not problem.strip():
+            raise TRIZChainError("Описание задачи (problem) не может быть пустым.")
+
+        problem = problem.strip()
+        logger.info("TRIZ solve pipeline: длина задачи=%d", len(problem))
+
+        return self._run_pipeline(
+            problem,
+            brief=brief,
+            profile=profile,
+            on_progress=on_progress,
+            on_stage_complete=on_stage_complete,
+            from_step="core_analysis",
+        )
+
+    def resume(
+        self,
+        problem: str,
+        *,
+        from_step: str,
+        artifacts: dict[str, dict],
+        brief: InterviewBrief | None = None,
+        profile: AnalysisProfile | None = None,
+        on_progress: Callable[[int, str], None] | None = None,
+        on_stage_complete: Callable[[str, dict], None] | None = None,
+    ) -> dict:
+        """
+        Перезапуск пайплайна с произвольного шага по сохранённым артефактам.
+
+        artifacts — снимки всех шагов до from_step (переопределения пользователя
+        накладываются поверх). Шаги до from_step восстанавливаются из артефактов
+        без LLM-валидации; детерминированный reconcile_contradiction_type применяется.
+        """
+        if not problem or not problem.strip():
+            raise TRIZChainError("Описание задачи (problem) не может быть пустым.")
+
+        problem = problem.strip()
+        logger.info(
+            "TRIZ resume pipeline: from_step=%s, длина задачи=%d",
+            from_step,
+            len(problem),
+        )
+
+        return self._run_pipeline(
+            problem,
+            brief=brief,
+            profile=profile,
+            on_progress=on_progress,
+            on_stage_complete=on_stage_complete,
+            from_step=from_step,
+            artifacts=artifacts,
+        )

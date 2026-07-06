@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 JobStatus = Literal["running", "done", "error"]
+JobKind = Literal["solve", "rerun"]
 
 FINISHED_JOB_TTL_SECONDS = 3600
 
@@ -24,6 +25,9 @@ class SolveJobRecord:
     result: dict[str, Any] | None = None
     error: str | None = None
     chat_session_id: str | None = None
+    job_kind: JobKind = "solve"
+    parent_entry_id: str | None = None
+    rerun_from_step: str | None = None
     created_at: float = field(default_factory=time.time)
     finished_at: float | None = None
 
@@ -39,6 +43,9 @@ class SolveJobStore:
         problem: str,
         *,
         chat_session_id: str | None = None,
+        job_kind: JobKind = "solve",
+        parent_entry_id: str | None = None,
+        rerun_from_step: str | None = None,
     ) -> str:
         job_id = str(uuid.uuid4())
         with self._lock:
@@ -48,6 +55,9 @@ class SolveJobStore:
                 user_id=user_id,
                 problem=problem,
                 chat_session_id=chat_session_id,
+                job_kind=job_kind,
+                parent_entry_id=parent_entry_id,
+                rerun_from_step=rerun_from_step,
             )
         return job_id
 
@@ -95,9 +105,17 @@ class SolveJobStore:
                 result=job.result,
                 error=job.error,
                 chat_session_id=job.chat_session_id,
+                job_kind=job.job_kind,
+                parent_entry_id=job.parent_entry_id,
+                rerun_from_step=job.rerun_from_step,
                 created_at=job.created_at,
                 finished_at=job.finished_at,
             )
+
+    def reset(self) -> None:
+        """Сброс in-memory jobs (только для тестов)."""
+        with self._lock:
+            self._jobs.clear()
 
     def _purge_expired_locked(self) -> None:
         now = time.time()

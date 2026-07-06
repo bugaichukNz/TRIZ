@@ -69,6 +69,7 @@ def _row_to_entry(row: sqlite3.Row) -> dict[str, Any]:
         "time": row["time_display"],
         "created_at": row["created_at"],
         "chat_session_id": row["chat_session_id"] if "chat_session_id" in keys else None,
+        "parent_entry_id": row["parent_entry_id"] if "parent_entry_id" in keys else None,
     }
 
 
@@ -103,6 +104,8 @@ class SessionsStore:
         if cols and "user_id" not in cols:
             conn.execute("ALTER TABLE history_entries ADD COLUMN user_id TEXT")
             self._assign_orphan_user_ids(conn)
+        if cols and "parent_entry_id" not in cols:
+            conn.execute("ALTER TABLE history_entries ADD COLUMN parent_entry_id TEXT")
         from backend.artifacts_store import _ARTIFACTS_SCHEMA
 
         conn.executescript(_ARTIFACTS_SCHEMA)
@@ -167,10 +170,24 @@ class SessionsStore:
     def _trim(self, conn: sqlite3.Connection) -> None:
         conn.execute(
             """
+            DELETE FROM stage_artifacts
+            WHERE entry_id IN (
+                SELECT id FROM history_entries
+                WHERE id NOT IN (
+                    SELECT id FROM history_entries
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT ?
+                )
+            )
+            """,
+            (self.max_entries,),
+        )
+        conn.execute(
+            """
             DELETE FROM history_entries
             WHERE id NOT IN (
                 SELECT id FROM history_entries
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC, rowid DESC
                 LIMIT ?
             )
             """,
@@ -190,7 +207,7 @@ class SessionsStore:
             if summary:
                 rows = conn.execute(
                     """
-                    SELECT id, problem, time_display, created_at, chat_session_id
+                    SELECT id, problem, time_display, created_at, chat_session_id, parent_entry_id
                     FROM history_entries
                     WHERE user_id = ?
                     ORDER BY created_at DESC
@@ -205,12 +222,13 @@ class SessionsStore:
                         "time": row["time_display"],
                         "created_at": row["created_at"],
                         "chat_session_id": row["chat_session_id"],
+                        "parent_entry_id": row["parent_entry_id"],
                     }
                     for row in rows
                 ]
             rows = conn.execute(
                 """
-                SELECT id, problem, result_json, time_display, created_at, chat_session_id
+                SELECT id, problem, result_json, time_display, created_at, chat_session_id, parent_entry_id
                 FROM history_entries
                 WHERE user_id = ?
                 ORDER BY created_at DESC
@@ -226,7 +244,7 @@ class SessionsStore:
             if user_id is not None:
                 row = conn.execute(
                     """
-                    SELECT id, problem, result_json, time_display, created_at, chat_session_id
+                    SELECT id, problem, result_json, time_display, created_at, chat_session_id, parent_entry_id
                     FROM history_entries
                     WHERE id = ? AND user_id = ?
                     """,
@@ -235,7 +253,7 @@ class SessionsStore:
             else:
                 row = conn.execute(
                     """
-                    SELECT id, problem, result_json, time_display, created_at, chat_session_id
+                    SELECT id, problem, result_json, time_display, created_at, chat_session_id, parent_entry_id
                     FROM history_entries
                     WHERE id = ?
                     """,
@@ -252,7 +270,7 @@ class SessionsStore:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT id, problem, result_json, time_display, created_at, chat_session_id
+                SELECT id, problem, result_json, time_display, created_at, chat_session_id, parent_entry_id
                 FROM history_entries
                 WHERE chat_session_id = ? AND user_id = ?
                 ORDER BY created_at DESC
@@ -297,6 +315,7 @@ class SessionsStore:
         time_display: str | None = None,
         chat_session_id: str | None = None,
         user_id: str | None = None,
+        parent_entry_id: str | None = None,
     ) -> dict[str, Any]:
         self._init_once()
         entry = {
@@ -306,13 +325,14 @@ class SessionsStore:
             "time": time_display or _now_display(),
             "created_at": _now_iso(),
             "chat_session_id": chat_session_id,
+            "parent_entry_id": parent_entry_id,
         }
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO history_entries
-                    (id, user_id, problem, result_json, time_display, created_at, chat_session_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (id, user_id, problem, result_json, time_display, created_at, chat_session_id, parent_entry_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     entry["id"],
@@ -322,6 +342,7 @@ class SessionsStore:
                     entry["time"],
                     entry["created_at"],
                     entry["chat_session_id"],
+                    entry["parent_entry_id"],
                 ),
             )
             self._trim(conn)

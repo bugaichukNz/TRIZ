@@ -100,3 +100,19 @@ def _isolate_settings(monkeypatch: pytest.MonkeyPatch) -> None:
         os.environ["JWT_SECRET"],
     )
     monkeypatch.setattr(settings, "effects_rag_enabled", False)  # изоляция: дефолт True
+
+
+@pytest.fixture(autouse=True)
+def _isolate_app_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """Сброс singleton-кешей, solve_jobs и дефолтной БД на tmp_path."""
+    from backend.main import app, get_chain, get_chat_store, get_chat_service
+    from backend.solve_jobs import solve_jobs
+
+    app.dependency_overrides.clear()
+    get_chain.cache_clear()
+    get_chat_store.cache_clear()
+    get_chat_service.cache_clear()
+    solve_jobs.reset()
+
+    db_path = tmp_path / "pytest-isolated.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{db_path.as_posix()}")

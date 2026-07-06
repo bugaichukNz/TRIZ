@@ -35,6 +35,14 @@ def isolated_stores(tmp_path):
     return sessions, artifacts
 
 
+@pytest.fixture
+def trim_stores(tmp_path):
+    db_path = tmp_path / "trim.db"
+    sessions = SessionsStore(db_path=db_path, max_entries=2)
+    artifacts = ArtifactsStore(db_path=db_path)
+    return sessions, artifacts
+
+
 def _solve_with_buffer(
     chain: TRIZChain,
     profile=None,
@@ -148,11 +156,9 @@ class TestStageArtifactsStore:
 
     def test_history_trim_deletes_artifacts(
         self,
-        tmp_path,
+        trim_stores,
     ) -> None:
-        db_path = tmp_path / "trim.db"
-        sessions = SessionsStore(db_path=db_path, max_entries=2)
-        artifacts = ArtifactsStore(db_path=db_path)
+        sessions, artifacts = trim_stores
 
         entries = []
         for i in range(3):

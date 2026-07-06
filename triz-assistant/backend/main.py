@@ -19,8 +19,13 @@ from backend.config import settings
 
 from backend.chat_service import ChatService, ChatServiceError
 from backend.chat_store import ChatStore
-from backend.llm.chain import TRIZChain, TRIZChainError
-from backend.llm.models import StageArtifact
+from backend.llm.chain import (
+    TRIZChain,
+    TRIZChainError,
+    _RESUME_REQUIRED_ARTIFACTS,
+    validate_psa_fp_override,
+)
+from backend.llm.models import AnalysisProfile, StageArtifact
 
 from backend.schemas import (
     ActiveChatStateResponse,
@@ -42,6 +47,7 @@ from backend.schemas import (
     HistoryEntryCreate,
     LoginRequest,
     LoginResponse,
+    RerunRequest,
     SessionsListResponse,
     SessionsReplaceRequest,
     SolveJobCreateResponse,
@@ -119,6 +125,140 @@ def _session_to_response(session: dict) -> ChatSessionResponse:
         created_at=session["created_at"],
         updated_at=session["updated_at"],
     )
+
+
+def _resolve_rerun_profile(
+    parent_result: dict,
+    profile: AnalysisProfile | None,
+) -> AnalysisProfile | None:
+    if profile is not None:
+        return profile
+    raw = parent_result.get("analysis_profile")
+    if raw is None:
+        return None
+    if isinstance(raw, AnalysisProfile):
+        return raw
+    if isinstance(raw, dict):
+        return AnalysisProfile.model_validate(raw)
+    return None
+
+
+def _run_rerun_job(
+    job_id: str,
+    user_id: str,
+    entry_id: str,
+    from_step: str,
+    overrides: dict[str, dict] | None,
+    profile: AnalysisProfile | None,
+) -> None:
+    chain = get_chain()
+    store = get_sessions_store()
+    artifacts_store = get_artifacts_store()
+
+    parent = store.get_entry(entry_id, user_id=user_id)
+    if parent is None:
+        solve_jobs.fail(job_id, "Запись не найдена.")
+        analysis_progress.fail(job_id, "Запись не найдена.")
+        return
+
+    artifacts_loaded = artifacts_store.load_all_with_metadata(entry_id, user_id=user_id)
+    if artifacts_loaded is None:
+        solve_jobs.fail(job_id, "Запись не найдена.")
+        analysis_progress.fail(job_id, "Запись не найдена.")
+        return
+
+    merged_artifacts = {
+        step_id: item["payload"] for step_id, item in artifacts_loaded.items()
+    }
+    override_steps: set[str] = set()
+    if overrides:
+        override_steps = set(overrides.keys())
+        merged_artifacts.update(overrides)
+
+    resolved_profile = _resolve_rerun_profile(parent["result"], profile)
+
+    analysis_progress.start(job_id)
+
+    def on_progress(pct: int, stage: str) -> None:
+        analysis_progress.update(job_id, pct, stage)
+        solve_jobs.update_progress(job_id, pct, stage)
+
+    on_stage_complete, artifact_buffer, profile_hash = make_artifact_buffer(resolved_profile)
+
+    try:
+        result = chain.resume(
+            parent["problem"],
+            from_step=from_step,
+            artifacts=merged_artifacts,
+            profile=resolved_profile,
+            on_progress=on_progress,
+            on_stage_complete=on_stage_complete,
+        )
+        result["rerun_from_step"] = from_step
+        result["parent_entry_id"] = entry_id
+
+        new_entry = store.add_entry(
+            parent["problem"],
+            result,
+            chat_session_id=parent.get("chat_session_id"),
+            user_id=user_id,
+            parent_entry_id=entry_id,
+        )
+
+        restored_steps = set(_RESUME_REQUIRED_ARTIFACTS[from_step])
+        for step_id in restored_steps:
+            if step_id not in merged_artifacts:
+                continue
+            payload = dict(merged_artifacts[step_id])
+            if step_id in override_steps:
+                payload["_user_override"] = True
+                step_hash = profile_hash
+            else:
+                step_hash = artifacts_loaded[step_id]["profile_hash"]
+            artifacts_store.save(
+                new_entry["id"],
+                step_id,
+                payload,
+                profile_hash=step_hash,
+                user_id=user_id,
+            )
+        for step_id, payload in artifact_buffer:
+            artifacts_store.save(
+                new_entry["id"],
+                step_id,
+                payload,
+                profile_hash=profile_hash,
+                user_id=user_id,
+            )
+
+        solve_jobs.complete(job_id, result)
+        analysis_progress.complete(job_id)
+        logger.info("Rerun job %s completed -> entry %s", job_id, new_entry["id"])
+    except TRIZChainError as exc:
+        solve_jobs.fail(job_id, str(exc))
+        analysis_progress.fail(job_id, str(exc))
+        logger.error("Rerun job %s TRIZ error: %s", job_id, exc)
+    except Exception as exc:
+        solve_jobs.fail(job_id, str(exc))
+        analysis_progress.fail(job_id, str(exc))
+        logger.exception("Rerun job %s failed", job_id)
+
+
+def _start_rerun_job_thread(
+    job_id: str,
+    user_id: str,
+    entry_id: str,
+    from_step: str,
+    overrides: dict[str, dict] | None,
+    profile: AnalysisProfile | None,
+) -> None:
+    thread = threading.Thread(
+        target=_run_rerun_job,
+        args=(job_id, user_id, entry_id, from_step, overrides, profile),
+        daemon=True,
+        name=f"rerun-job-{job_id[:8]}",
+    )
+    thread.start()
 
 
 def _run_solve_job(
@@ -276,7 +416,7 @@ def root() -> dict[str, str]:
         "service": "TRIZ AI Assistant",
         "docs": "/docs",
         "health": "/health",
-        "solve": "POST /solve, POST /solve/jobs, GET /solve/jobs/{job_id}, GET /solve/entries/{entry_id}/artifacts",
+        "solve": "POST /solve, POST /solve/jobs, GET /solve/jobs/{job_id}, POST /solve/entries/{entry_id}/rerun, GET /solve/entries/{entry_id}/artifacts",
         "chat": "GET/POST /chat/sessions, DELETE /chat/sessions, POST /chat/sessions/bulk-delete, GET /chat/sessions/{id}, ...",
         "sessions": "GET/POST/PUT/DELETE /sessions",
         "auth": "POST /auth/login, GET /auth/me",
@@ -457,6 +597,9 @@ def get_solve_job(
     return SolveJobStatusResponse(
         status=job.status,
         progress=SolveJobProgress(pct=pct, stage=stage),
+        job_kind=job.job_kind,
+        parent_entry_id=job.parent_entry_id,
+        rerun_from_step=job.rerun_from_step,
         result=result,
         error=job.error,
     )
@@ -497,6 +640,46 @@ def get_stage_artifact(
     if artifact is None:
         raise HTTPException(status_code=404, detail="Артефакт не найден.")
     return artifact
+
+
+@app.post(
+    "/solve/entries/{entry_id}/rerun",
+    response_model=SolveJobCreateResponse,
+    tags=["triz"],
+    summary="Перезапустить TRIZ-анализ с произвольного шага",
+)
+def rerun_solve_entry(
+    entry_id: str,
+    body: RerunRequest,
+    user: CurrentUser,
+    store: SessionsStore = Depends(get_sessions_store),
+) -> SolveJobCreateResponse:
+    """Фоновый перезапуск пайплайна по артефактам записи с опциональными overrides."""
+    parent = store.get_entry(entry_id, user_id=user["id"])
+    if parent is None:
+        raise HTTPException(status_code=404, detail="Запись не найдена.")
+
+    try:
+        validate_psa_fp_override(body.overrides)
+    except TRIZChainError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    job_id = solve_jobs.create(
+        user["id"],
+        parent["problem"],
+        job_kind="rerun",
+        parent_entry_id=entry_id,
+        rerun_from_step=body.from_step,
+    )
+    _start_rerun_job_thread(
+        job_id,
+        user["id"],
+        entry_id,
+        body.from_step,
+        body.overrides,
+        body.profile,
+    )
+    return SolveJobCreateResponse(job_id=job_id, status="running")
 
 
 @app.get(

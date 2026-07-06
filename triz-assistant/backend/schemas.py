@@ -62,6 +62,9 @@ class SolveJobProgress(BaseModel):
 class SolveJobStatusResponse(BaseModel):
     status: str = Field(description="running | done | error")
     progress: SolveJobProgress
+    job_kind: str = Field(default="solve", description="solve | rerun")
+    parent_entry_id: str | None = None
+    rerun_from_step: str | None = None
     result: "SolveResponse | None" = None
     error: str | None = None
 
@@ -120,6 +123,16 @@ class SolveResponse(BaseModel):
         description="Профиль анализа, применённый при формировании отчёта",
     )
 
+    parent_entry_id: str | None = Field(
+        default=None,
+        description="ID родительской записи при перезапуске пайплайна (rerun)",
+    )
+
+    rerun_from_step: str | None = Field(
+        default=None,
+        description="Шаг, с которого выполнен перезапуск пайплайна",
+    )
+
 
 class ToolRegistryItem(BaseModel):
     key: str
@@ -172,6 +185,29 @@ class HistoryEntry(BaseModel):
     created_at: str | None = None
 
     chat_session_id: str | None = None
+
+    parent_entry_id: str | None = Field(
+        default=None,
+        description="ID родительской записи при перезапуске пайплайна (rerun)",
+    )
+
+
+class RerunRequest(BaseModel):
+    """Перезапуск TRIZ-анализа с произвольного шага."""
+
+    from_step: str = Field(
+        description="psa_fp_validation | effects_retrieval | solution_generation | assembly",
+    )
+
+    overrides: dict[str, dict] | None = Field(
+        default=None,
+        description="Переопределения артефактов этапов (накладываются поверх сохранённых)",
+    )
+
+    profile: AnalysisProfile | None = Field(
+        default=None,
+        description="Профиль анализа; None — взять из родительской записи",
+    )
 
 
 class HistoryEntryCreate(BaseModel):
