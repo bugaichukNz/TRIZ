@@ -89,6 +89,22 @@ export interface TRIZAnalysisResult {
   reasoning?: string
   effects_used?: string[]
   pipeline_trace?: PipelineStepTrace[]
+  analysis_profile?: AnalysisProfile
+}
+
+export interface AnalysisProfile {
+  tools_enabled: Record<string, boolean>
+  effects_rag: boolean
+  target_solutions: number
+  psa_fp_validation: boolean
+}
+
+export interface ToolRegistryItem {
+  key: string
+  title: string
+  description: string
+  category: 'базовый' | 'опциональный'
+  warning_if_disabled: string | null
 }
 
 export type ChatSessionStatus = 'interview' | 'ready' | 'analyzed'
@@ -169,6 +185,7 @@ export interface SolveRequest {
   problem: string
   chat_session_id?: string | null
   force?: boolean
+  profile?: AnalysisProfile
 }
 
 export interface SolveJobCreateResponse {

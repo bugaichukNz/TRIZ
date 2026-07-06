@@ -10,7 +10,7 @@ import pytest
 from backend.config import settings
 from backend.llm.chain import TRIZChain
 from backend.llm.effects_rag import EFFECTS_BLOCK_HEADER, build_effects_block
-from backend.llm.models import EffectQueries, PhysicalEffect, SolutionSet
+from backend.llm.models import AnalysisProfile, EffectQueries, PhysicalEffect, SolutionSet
 from backend.llm.solution_prompt import SOLUTION_USER_PROMPT
 
 # Промпт до добавления {effects_block} — эталон для byte-parity при выключенном флаге.
@@ -206,7 +206,10 @@ class TestEffectsPromptParity:
             lambda: MockRetriever(),
         )
 
-        effects_block, names = chain_with_fake_llm._retrieve_effects_for_solutions(CORE_FIXTURE)
+        effects_block, names = chain_with_fake_llm._retrieve_effects_for_solutions(
+            CORE_FIXTURE,
+            profile=AnalysisProfile.default_profile().model_copy(update={"effects_rag": True}),
+        )
         assert names == [SAMPLE_EFFECT.name]
         assert EFFECTS_BLOCK_HEADER in effects_block
 
@@ -240,7 +243,7 @@ class TestEffectsSolveResilience:
         )
 
         chain = chain_with_fake_llm
-        chain._run_core_analysis = lambda _problem, brief=None: dict(CORE_FIXTURE)
+        chain._run_core_analysis = lambda _problem, brief=None, **_: dict(CORE_FIXTURE)
         chain._validate_and_fix_fp = lambda _problem, core, brief=None: (core, 1, [], True)
 
         def _pass_validation(*_args: Any, **_kwargs: Any) -> tuple[bool, str, list[dict]]:
@@ -268,7 +271,7 @@ class TestEffectsSolveResilience:
         monkeypatch.setattr(settings, "effects_rag_enabled", False)
 
         chain = chain_with_fake_llm
-        chain._run_core_analysis = lambda _problem, brief=None: dict(CORE_FIXTURE)
+        chain._run_core_analysis = lambda _problem, brief=None, **_: dict(CORE_FIXTURE)
         chain._validate_and_fix_fp = lambda _problem, core, brief=None: (core, 1, [], True)
 
         def _pass_validation(*_args: Any, **_kwargs: Any) -> tuple[bool, str, list[dict]]:
@@ -345,7 +348,7 @@ class TestEffectsRagStartup:
         )
 
         chain = chain_with_fake_llm
-        chain._run_core_analysis = lambda _problem, brief=None: dict(CORE_FIXTURE)
+        chain._run_core_analysis = lambda _problem, brief=None, **_: dict(CORE_FIXTURE)
         chain._validate_and_fix_fp = lambda _problem, core, brief=None: (core, 1, [], True)
 
         def _pass_validation(*_args: Any, **_kwargs: Any) -> tuple[bool, str, list[dict]]:

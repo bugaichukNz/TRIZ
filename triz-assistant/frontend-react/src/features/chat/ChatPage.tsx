@@ -46,13 +46,14 @@ import {
 
 } from '../../app/api'
 
-import { useAppDispatch } from '../../app/store'
+import type { AnalysisProfile } from '../../types/triz'
 
 import { AnalysisProgressOverlay } from '../../components/AnalysisProgressOverlay'
 import { Layout } from '../../components/Layout'
 
 import { ProgressStepper } from '../../components/ProgressStepper'
 
+import { AnalysisProfilePanel } from './AnalysisProfilePanel'
 import { ChatInput } from './ChatInput'
 
 import { ChatMessageList } from './ChatMessageList'
@@ -142,6 +143,7 @@ export function ChatPage() {
   const [analyzing, setAnalyzing] = useState(false)
   const [analyzeProgress, setAnalyzeProgress] = useState(0)
   const [analyzeStage, setAnalyzeStage] = useState('')
+  const [analysisProfile, setAnalysisProfile] = useState<AnalysisProfile | undefined>(undefined)
   const resumeJobRef = useRef<string | null>(null)
   const pollAbortControllerRef = useRef<AbortController | null>(null)
 
@@ -424,6 +426,7 @@ export function ChatPage() {
           problem: session?.brief ?? 'chat',
           chat_session_id: sessionId,
           force: options?.force ?? false,
+          ...(analysisProfile ? { profile: analysisProfile } : {}),
         }).unwrap()
         if (signal.aborted) return
         storeSolveJobId(sessionId, created.job_id)
@@ -458,7 +461,7 @@ export function ChatPage() {
         }
       }
     },
-    [sessionId, session?.brief, beginPolling, createSolveJob, fetchSolveJobStatus, pollSolveJob, finishSuccessfulJob],
+    [sessionId, session?.brief, analysisProfile, beginPolling, createSolveJob, fetchSolveJobStatus, pollSolveJob, finishSuccessfulJob],
   )
 
   useEffect(() => {
@@ -677,6 +680,12 @@ export function ChatPage() {
 
           </Alert>
 
+        )}
+
+
+
+        {status === 'ready' && (
+          <AnalysisProfilePanel onProfileChange={setAnalysisProfile} />
         )}
 
 

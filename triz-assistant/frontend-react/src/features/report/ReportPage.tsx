@@ -12,6 +12,7 @@ import { Layout } from '../../components/Layout'
 import type { TRIZAnalysisResult } from '../../types/triz'
 import { ReportSections } from './ReportSections'
 import { PipelineTimeline } from './PipelineTimeline'
+import { NonStandardProfileBadge } from './NonStandardProfileBadge'
 import Accordion from '@mui/material/Accordion'
 import AccordionDetails from '@mui/material/AccordionDetails'
 import AccordionSummary from '@mui/material/AccordionSummary'
@@ -140,6 +141,7 @@ export function ReportPage() {
 
         {report && (
           <>
+            <NonStandardProfileBadge profile={report.result.analysis_profile} />
             {report.result.pipeline_trace && report.result.pipeline_trace.length > 0 && (
               <Accordion
                 defaultExpanded={false}

@@ -17,6 +17,7 @@ from backend.llm.effects_query_prompt import (
 from backend.llm.effects_rag import build_effects_block
 from backend.llm.effects_retriever import get_effects_retriever
 from backend.llm.models import (
+    AnalysisProfile,
     ContradictionRepair,
     EffectQueries,
     InterviewBrief,
@@ -43,6 +44,7 @@ from backend.llm.psa_validator import (
     validate_root_cause_not_crutch,
 )
 from backend.llm.interview_state import InterviewStateManager
+from backend.llm.profile_prompts import get_solution_system_prompt, get_solution_user_prompt
 from backend.llm.solution_prompt import SOLUTION_SYSTEM_PROMPT, SOLUTION_USER_PROMPT
 from backend.llm.solution_validator import (
     MAX_SOLUTION_GENERATION_ATTEMPTS,
@@ -54,6 +56,7 @@ from backend.llm.solution_validator import (
     validate_solutions,
 )
 from backend.llm.system_prompt import CORE_SYSTEM_PROMPT, CORE_USER_PROMPT
+from backend.llm.tools_registry import TOOL_MANDATORY_MARKER_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -144,13 +147,16 @@ _MANDATORY_TOOL_MARKERS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _missing_mandatory_tools(result: dict) -> list[str]:
+def _missing_mandatory_tools(result: dict, profile: AnalysisProfile) -> list[str]:
     tools_text = " ".join((t.get("tool") or "").lower() for t in result.get("triz_tools", []))
-    return [
-        name
-        for name, markers in _MANDATORY_TOOL_MARKERS.items()
-        if not any(m in tools_text for m in markers)
-    ]
+    missing: list[str] = []
+    for tool_key, marker_name in TOOL_MANDATORY_MARKER_NAMES.items():
+        if not profile.tools_enabled.get(tool_key, False):
+            continue
+        markers = _MANDATORY_TOOL_MARKERS[marker_name]
+        if not any(m in tools_text for m in markers):
+            missing.append(marker_name)
+    return missing
 
 
 # Legacy fallback: извлечение полей брифа из сырого текста (POST /solve без InterviewBrief).
@@ -367,12 +373,22 @@ class TRIZChain:
             return TRIZAnalysisCore.model_validate(result).model_dump()
         raise TRIZChainError(f"Неожиданный тип ответа core-анализа: {type(result).__name__}")
 
-    def _run_core_analysis(self, problem: str, brief: InterviewBrief | None = None) -> dict:
+    def _run_core_analysis(
+        self,
+        problem: str,
+        brief: InterviewBrief | None = None,
+        *,
+        profile: AnalysisProfile | None = None,
+    ) -> dict:
         """Этап a: core-анализ → TRIZAnalysisCore."""
+        resolved = AnalysisProfile.resolve(profile)
+        effective_problem = problem + resolved.core_prompt_suffix()
         with wrap_openai_errors("core-анализа TRIZChain.solve"):
-            result = self._core_chain.invoke({"problem": problem})
+            result = self._core_chain.invoke({"problem": effective_problem})
 
-        return self._enrich_core_attempt_history(self._parse_core_result(result), problem, brief)
+        return self._enrich_core_attempt_history(
+            self._parse_core_result(result), problem, brief
+        )
 
     def _validate_and_fix_fp(
         self, problem: str, core: dict, brief: InterviewBrief | None = None
@@ -456,10 +472,17 @@ class TRIZChain:
             return [str(raw).strip()]
         return []
 
-    def _retrieve_effects_for_solutions(self, core: dict) -> tuple[str, list[str]]:
+    def _retrieve_effects_for_solutions(
+        self, core: dict, *, profile: AnalysisProfile
+    ) -> tuple[str, list[str]]:
         """Подбор релевантных физэффектов для промпта генерации решений."""
-        if not settings.effects_rag_enabled:
+        if not profile.effects_rag:
             return "", []
+
+        if not settings.effects_rag_enabled:
+            retriever = get_effects_retriever()
+            if not retriever.enabled:
+                return "", []
 
         try:
             result = self._effect_queries_chain.invoke(
@@ -544,8 +567,10 @@ class TRIZChain:
         validator_feedback: str = "",
         brief: InterviewBrief | None = None,
         effects_block: str = "",
+        profile: AnalysisProfile | None = None,
     ) -> list[dict]:
         """Генерация solution_concepts по валидированному ядру."""
+        resolved = AnalysisProfile.resolve(profile)
         solution_input = self._build_solution_input(
             core,
             problem,
@@ -553,7 +578,17 @@ class TRIZChain:
             brief=brief,
             effects_block=effects_block,
         )
-        result = self._solution_chain.invoke(solution_input)
+        if resolved.target_solutions == 4:
+            result = self._solution_chain.invoke(solution_input)
+        else:
+            prompt = ChatPromptTemplate.from_messages(
+                [
+                    ("system", get_solution_system_prompt(resolved)),
+                    ("human", get_solution_user_prompt(resolved)),
+                ]
+            )
+            chain = prompt | self._solution_llm
+            result = chain.invoke(solution_input)
         if isinstance(result, SolutionSet):
             return [s.model_dump() for s in result.solution_concepts]
         if isinstance(result, dict):
@@ -567,6 +602,7 @@ class TRIZChain:
         brief: InterviewBrief | None = None,
         *,
         effects_block: str = "",
+        profile: AnalysisProfile | None = None,
     ) -> tuple[list[dict], str, int, list[str]]:
         """
         Генерация решений + валидация с накоплением валидных попыток.
@@ -591,7 +627,7 @@ class TRIZChain:
             try:
                 if attempt == 1:
                     batch = self._generate_solutions(
-                        core, problem, brief=brief, effects_block=effects_block
+                        core, problem, brief=brief, effects_block=effects_block, profile=profile
                     )
                 else:
                     batch = self._generate_solutions(
@@ -600,6 +636,7 @@ class TRIZChain:
                         validator_feedback=feedback,
                         brief=brief,
                         effects_block=effects_block,
+                        profile=profile,
                     )
             except Exception as exc:
                 logger.warning(
@@ -769,6 +806,7 @@ class TRIZChain:
         problem: str,
         *,
         brief: InterviewBrief | None = None,
+        profile: AnalysisProfile | None = None,
         on_progress: Callable[[int, str], None] | None = None,
     ) -> dict:
         """
@@ -793,6 +831,7 @@ class TRIZChain:
             raise TRIZChainError("Описание задачи (problem) не может быть пустым.")
 
         problem = problem.strip()
+        resolved_profile = AnalysisProfile.resolve(profile)
         logger.info("TRIZ solve pipeline: длина задачи=%d", len(problem))
 
         _progress(5, "Подготовка к анализу")
@@ -804,10 +843,17 @@ class TRIZChain:
         core_attempts = 1
         core_notes: list[str] = []
         core_warning = False
+        profile_deviations = resolved_profile.describe_deviations()
+        if profile_deviations:
+            core_notes.append(
+                _truncate_trace_note(
+                    "нестандартный профиль: " + "; ".join(profile_deviations)
+                )
+            )
 
         _progress(10, "TRIZ core-анализ")
-        core = self._run_core_analysis(problem, brief)
-        missing = _missing_mandatory_tools(core)
+        core = self._run_core_analysis(problem, brief, profile=resolved_profile)
+        missing = _missing_mandatory_tools(core, resolved_profile)
         if missing:
             logger.info(
                 "Обязательные инструменты ШАГ 2.1 отсутствуют после первого прохода: %s — повтор",
@@ -823,9 +869,9 @@ class TRIZChain:
                 f"ШАГ 2.1: {', '.join(missing)}. Включи их в triz_tools с конкретными "
                 "результатами применения к данной задаче."
             )
-            core = self._run_core_analysis(problem + retry_note, brief)
+            core = self._run_core_analysis(problem + retry_note, brief, profile=resolved_profile)
             core_attempts = 2
-            still_missing = _missing_mandatory_tools(core)
+            still_missing = _missing_mandatory_tools(core, resolved_profile)
             if still_missing:
                 core_warning = True
                 logger.warning(
@@ -859,7 +905,12 @@ class TRIZChain:
         # --- psa_fp_validation ---
         t0 = time.perf_counter()
         _progress(35, "Валидация физического противоречия")
-        core, fp_attempts, fp_notes, fp_ok = self._validate_and_fix_fp(problem, core, brief)
+        if not resolved_profile.psa_fp_validation:
+            fp_attempts = 0
+            fp_notes = ["отключено профилем"]
+            fp_ok = False
+        else:
+            core, fp_attempts, fp_notes, fp_ok = self._validate_and_fix_fp(problem, core, brief)
         core, type_note = reconcile_contradiction_type(core)
         if type_note:
             logger.info("TRIZ contradiction_type reconciled: %s", type_note)
@@ -867,8 +918,12 @@ class TRIZChain:
         _append_pipeline_step(
             pipeline_trace,
             step_id="psa_fp_validation",
-            status=_step_status(fp_attempts, success=fp_ok),
-            attempts=fp_attempts,
+            status=(
+                "warning"
+                if not resolved_profile.psa_fp_validation
+                else _step_status(fp_attempts, success=fp_ok)
+            ),
+            attempts=max(fp_attempts, 1),
             tools_used=[],
             validator_notes=fp_notes,
             duration_ms=int((time.perf_counter() - t0) * 1000),
@@ -877,11 +932,16 @@ class TRIZChain:
         # --- effects_retrieval ---
         t0 = time.perf_counter()
         _progress(45, "Подбор физических эффектов")
-        if not settings.effects_rag_enabled:
+        if not resolved_profile.effects_rag:
             effects_block, effects_used = "", []
-            effects_notes = ["отключён"]
+            if profile is not None and settings.effects_rag_enabled:
+                effects_notes = ["отключён профилем"]
+            else:
+                effects_notes = ["отключён"]
         else:
-            effects_block, effects_used = self._retrieve_effects_for_solutions(core)
+            effects_block, effects_used = self._retrieve_effects_for_solutions(
+                core, profile=resolved_profile
+            )
             effects_notes = []
             if not effects_used:
                 effects_notes.append(
@@ -902,7 +962,11 @@ class TRIZChain:
         _progress(50, "Генерация решений")
         solutions, generation_warning, sol_attempts, sol_notes = (
             self._validate_and_generate_solutions(
-                core, problem, brief, effects_block=effects_block
+                core,
+                problem,
+                brief,
+                effects_block=effects_block,
+                profile=resolved_profile,
             )
         )
         sol_ok = not generation_warning
@@ -938,6 +1002,7 @@ class TRIZChain:
         )
 
         payload["pipeline_trace"] = pipeline_trace
+        payload["analysis_profile"] = resolved_profile.model_dump()
 
         if len(payload.get("solution_concepts", [])) < 2:
             logger.warning(

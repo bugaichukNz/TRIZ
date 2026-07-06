@@ -71,7 +71,7 @@ def _make_chain(monkeypatch: pytest.MonkeyPatch, fake_llm) -> TRIZChain:
 
 
 def _stub_happy_path(chain: TRIZChain, monkeypatch: pytest.MonkeyPatch) -> None:
-    chain._run_core_analysis = lambda _problem, brief=None: dict(FULL_CORE_FIXTURE)
+    chain._run_core_analysis = lambda _problem, brief=None, **_: dict(FULL_CORE_FIXTURE)
     monkeypatch.setattr("backend.llm.chain.validate_psa_and_fp_alignment", lambda _c: (True, ""))
     monkeypatch.setattr(
         "backend.llm.chain.validate_fp",
@@ -111,7 +111,7 @@ class TestPipelineTraceFpRetry:
         fake_llm,
     ) -> None:
         chain = _make_chain(monkeypatch, fake_llm)
-        chain._run_core_analysis = lambda _problem, brief=None: dict(FULL_CORE_FIXTURE)
+        chain._run_core_analysis = lambda _problem, brief=None, **_: dict(FULL_CORE_FIXTURE)
 
         fp_calls = {"n": 0}
 

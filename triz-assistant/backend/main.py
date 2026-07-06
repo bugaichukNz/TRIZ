@@ -24,6 +24,7 @@ from backend.llm.chain import TRIZChain, TRIZChainError
 from backend.schemas import (
     ActiveChatStateResponse,
     ActiveChatStateUpdate,
+    AnalysisProfileRegistryResponse,
     AnalyzeProgressResponse,
     ChatAnalyzeRequest,
     ChatAnalyzeResponse,
@@ -47,6 +48,7 @@ from backend.schemas import (
     SolveJobProgress,
     SolveRequest,
     SolveResponse,
+    ToolRegistryItem,
     UserInfo,
 )
 from backend.sessions_store import SessionsStore
@@ -114,6 +116,7 @@ def _run_solve_job(
     *,
     chat_session_id: str | None = None,
     interview_brief: object | None = None,
+    analysis_profile: object | None = None,
 ) -> None:
     chain = get_chain()
     store = get_sessions_store()
@@ -126,7 +129,12 @@ def _run_solve_job(
         solve_jobs.update_progress(job_id, pct, stage)
 
     try:
-        result = chain.solve(problem, brief=interview_brief, on_progress=on_progress)
+        result = chain.solve(
+            problem,
+            brief=interview_brief,
+            profile=analysis_profile,
+            on_progress=on_progress,
+        )
         if chat_session_id:
             chat_store.mark_analyzed(chat_session_id, problem)
         store.add_entry(
@@ -155,6 +163,7 @@ def _start_solve_job_thread(
     *,
     chat_session_id: str | None = None,
     interview_brief: object | None = None,
+    analysis_profile: object | None = None,
 ) -> None:
     thread = threading.Thread(
         target=_run_solve_job,
@@ -162,6 +171,7 @@ def _start_solve_job_thread(
         kwargs={
             "chat_session_id": chat_session_id,
             "interview_brief": interview_brief,
+            "analysis_profile": analysis_profile,
         },
         daemon=True,
         name=f"solve-job-{job_id[:8]}",
@@ -298,6 +308,32 @@ def auth_me(user: CurrentUser) -> UserInfo:
     return UserInfo(id=user["id"], username=user["username"])
 
 
+@app.get(
+    "/analysis/profile/registry",
+    response_model=AnalysisProfileRegistryResponse,
+    tags=["analysis"],
+    summary="Реестр инструментов и дефолтный профиль анализа",
+)
+def get_analysis_profile_registry(user: CurrentUser) -> AnalysisProfileRegistryResponse:
+    from backend.llm.models import AnalysisProfile
+    from backend.llm.tools_registry import TOOLS_REGISTRY
+
+    tools = [
+        ToolRegistryItem(
+            key=key,
+            title=entry["title"],
+            description=entry["description"],
+            category=entry["category"],
+            warning_if_disabled=entry.get("warning_if_disabled"),
+        )
+        for key, entry in TOOLS_REGISTRY.items()
+    ]
+    return AnalysisProfileRegistryResponse(
+        tools=tools,
+        default_profile=AnalysisProfile.default_profile(),
+    )
+
+
 @app.post(
     "/solve",
     response_model=SolveResponse,
@@ -315,7 +351,7 @@ def solve_problem(
 
     Deprecated: предпочтительно POST /solve/jobs + GET /solve/jobs/{job_id}.
     """
-    result = chain.solve(body.problem)
+    result = chain.solve(body.problem, profile=body.profile)
     store.add_entry(body.problem, result, user_id=user["id"])
     return SolveResponse(**result)
 
@@ -355,6 +391,7 @@ def create_solve_job(
         problem,
         chat_session_id=chat_session_id,
         interview_brief=interview_brief,
+        analysis_profile=body.profile,
     )
     return SolveJobCreateResponse(job_id=job_id, status="running")
 

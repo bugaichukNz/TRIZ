@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from backend.llm.models import (
     AnalysisBlock,
+    AnalysisProfile,
     FinalConclusionBlock,
     PipelineStepTrace,
     RecommendationsBlock,
@@ -31,6 +32,11 @@ class SolveRequest(BaseModel):
     force: bool = Field(
         default=False,
         description="Только с chat_session_id: принудительно завершить интервью",
+    )
+
+    profile: AnalysisProfile | None = Field(
+        default=None,
+        description="Опциональный профиль анализа; None — стандартный профиль по умолчанию",
     )
 
     @model_validator(mode="after")
@@ -107,6 +113,24 @@ class SolveResponse(BaseModel):
         default_factory=list,
         description="Трассировка этапов пайплайна (не включается в HTML/DOCX-отчёты)",
     )
+
+    analysis_profile: AnalysisProfile | None = Field(
+        default=None,
+        description="Профиль анализа, применённый при формировании отчёта",
+    )
+
+
+class ToolRegistryItem(BaseModel):
+    key: str
+    title: str
+    description: str
+    category: str
+    warning_if_disabled: str | None = None
+
+
+class AnalysisProfileRegistryResponse(BaseModel):
+    tools: list[ToolRegistryItem]
+    default_profile: AnalysisProfile
 
 
 class HealthResponse(BaseModel):

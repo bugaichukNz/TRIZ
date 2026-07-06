@@ -403,6 +403,110 @@ class EffectQueries(BaseModel):
 PipelineStepStatus = Literal["ok", "ok_with_retries", "warning"]
 
 
+class AnalysisProfile(BaseModel):
+    """Per-run профиль TRIZ-анализа: инструменты и параметры пайплайна."""
+
+    tools_enabled: dict[str, bool] = Field(
+        description=(
+            "Ключи: tool_2_problem_statement, tool_14_ksa, tool_11_psa, "
+            "supfield_analysis, contradiction_matrix, trimming"
+        ),
+    )
+    effects_rag: bool = True
+    target_solutions: int = Field(default=4, ge=2, le=8)
+    psa_fp_validation: bool = True
+
+    @classmethod
+    def default_profile(cls) -> "AnalysisProfile":
+        from backend.config import settings
+        from backend.llm.tools_registry import DEFAULT_TOOLS_ENABLED
+
+        return cls(
+            tools_enabled=dict(DEFAULT_TOOLS_ENABLED),
+            effects_rag=settings.effects_rag_enabled,
+            target_solutions=4,
+            psa_fp_validation=True,
+        )
+
+    @classmethod
+    def resolve(cls, profile: "AnalysisProfile | None") -> "AnalysisProfile":
+        return profile if profile is not None else cls.default_profile()
+
+    def is_default(self) -> bool:
+        default = self.default_profile()
+        return (
+            self.tools_enabled == default.tools_enabled
+            and self.effects_rag == default.effects_rag
+            and self.target_solutions == default.target_solutions
+            and self.psa_fp_validation == default.psa_fp_validation
+        )
+
+    def core_prompt_suffix(self) -> str:
+        """Дополнение к user-промпту core-анализа; пустая строка для дефолтного профиля."""
+        if self.is_default():
+            return ""
+
+        from backend.llm.tools_registry import TOOLS_REGISTRY
+
+        enabled_titles: list[str] = []
+        excluded_titles: list[str] = []
+        for key, enabled in self.tools_enabled.items():
+            entry = TOOLS_REGISTRY.get(key)
+            if entry is None:
+                continue
+            title = entry["title"]
+            if enabled:
+                enabled_titles.append(title)
+            else:
+                excluded_titles.append(title)
+
+        lines: list[str] = []
+        if enabled_titles:
+            lines.append(
+                "Обязательные инструменты для этого анализа: "
+                + ", ".join(enabled_titles)
+                + "."
+            )
+        if excluded_titles:
+            lines.append("Исключи инструменты: " + ", ".join(excluded_titles) + ".")
+        return "\n\n" + "\n".join(lines) if lines else ""
+
+    def solution_count_label(self) -> str:
+        """«3–5» при дефолтном target_solutions=4, иначе точное число."""
+        if self.target_solutions == 4:
+            return "3–5"
+        return str(self.target_solutions)
+
+    def describe_deviations(self) -> list[str]:
+        """Человекочитаемый список отличий от дефолтного профиля."""
+        if self.is_default():
+            return []
+
+        from backend.llm.tools_registry import TOOLS_REGISTRY
+
+        default = self.default_profile()
+        notes: list[str] = []
+
+        for key, enabled in self.tools_enabled.items():
+            if enabled == default.tools_enabled.get(key):
+                continue
+            entry = TOOLS_REGISTRY.get(key)
+            title = entry["title"] if entry else key
+            notes.append(f"{'включён' if enabled else 'отключён'}: {title}")
+
+        if self.effects_rag != default.effects_rag:
+            notes.append(
+                f"effects-RAG: {'включён' if self.effects_rag else 'отключён'}"
+            )
+        if self.target_solutions != default.target_solutions:
+            notes.append(f"число решений: {self.target_solutions}")
+        if self.psa_fp_validation != default.psa_fp_validation:
+            notes.append(
+                f"валидация ПСА/ФП: {'включена' if self.psa_fp_validation else 'отключена'}"
+            )
+        return notes
+
+
 class PipelineStepTrace(BaseModel):
     """Трассировка одного этапа пайплайна TRIZChain.solve."""
 
