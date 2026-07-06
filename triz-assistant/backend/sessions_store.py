@@ -103,6 +103,9 @@ class SessionsStore:
         if cols and "user_id" not in cols:
             conn.execute("ALTER TABLE history_entries ADD COLUMN user_id TEXT")
             self._assign_orphan_user_ids(conn)
+        from backend.artifacts_store import _ARTIFACTS_SCHEMA
+
+        conn.executescript(_ARTIFACTS_SCHEMA)
 
     def _assign_orphan_user_ids(self, conn: sqlite3.Connection) -> None:
         tables = {

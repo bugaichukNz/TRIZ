@@ -10,6 +10,7 @@ from backend.llm.models import (
     PipelineStepTrace,
     RecommendationsBlock,
     SolutionConcept,
+    StageArtifact,
     SystemContext,
     TrizToolRow,
 )
@@ -306,6 +307,20 @@ class AnalyzeProgressResponse(BaseModel):
     status: str = Field(description="idle | running | completed | failed")
 
     error: str | None = None
+
+
+class StageArtifactMeta(BaseModel):
+    """Метаданные артефакта этапа (без payload)."""
+
+    step_id: str
+    created_at: str
+    profile_hash: str
+
+
+class StageArtifactListResponse(BaseModel):
+    """Список артефактов этапов для записи анализа."""
+
+    items: list[StageArtifactMeta]
 
 
 class LoginRequest(BaseModel):

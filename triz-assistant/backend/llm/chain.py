@@ -140,6 +140,30 @@ def _append_pipeline_step(
         logger.warning("Не удалось записать pipeline_trace для %s: %s", step_id, exc)
 
 
+def _psa_fp_snapshot(core: dict) -> dict:
+    analysis = core.get("analysis") or {}
+    return {
+        "root_cause": core.get("root_cause", ""),
+        "causal_chains": analysis.get("causal_chains", ""),
+        "technical_contradiction": core.get("technical_contradiction", ""),
+        "physical_contradiction": core.get("physical_contradiction", ""),
+        "contradiction_type": core.get("contradiction_type", ""),
+    }
+
+
+def _emit_stage_complete(
+    on_stage_complete: Callable[[str, dict], None] | None,
+    step_id: str,
+    payload: dict,
+) -> None:
+    if on_stage_complete is None:
+        return
+    try:
+        on_stage_complete(step_id, payload)
+    except Exception as exc:
+        logger.warning("Не удалось записать stage artifact для %s: %s", step_id, exc)
+
+
 _MANDATORY_TOOL_MARKERS: dict[str, tuple[str, ...]] = {
     "Инструмент 2": ("инструмент 2", "постановка задачи"),
     "Инструмент 14 (КСА)": ("инструмент 14", "кса", "компонентно-структурн"),
@@ -474,15 +498,15 @@ class TRIZChain:
 
     def _retrieve_effects_for_solutions(
         self, core: dict, *, profile: AnalysisProfile
-    ) -> tuple[str, list[str]]:
+    ) -> tuple[str, list[str], list[str]]:
         """Подбор релевантных физэффектов для промпта генерации решений."""
         if not profile.effects_rag:
-            return "", []
+            return "", [], []
 
         if not settings.effects_rag_enabled:
             retriever = get_effects_retriever()
             if not retriever.enabled:
-                return "", []
+                return "", [], []
 
         try:
             result = self._effect_queries_chain.invoke(
@@ -503,14 +527,15 @@ class TRIZChain:
 
             retriever = get_effects_retriever()
             effects = retriever.search(queries, top_k=6)
-            return build_effects_block(effects)
+            block, used = build_effects_block(effects)
+            return block, used, list(queries)
         except Exception as exc:
             logger.warning(
                 "Этап подбора физэффектов пропущен из-за ошибки: %s",
                 exc,
                 exc_info=True,
             )
-            return "", []
+            return "", [], []
 
     def _build_solution_input(
         self,
@@ -808,6 +833,7 @@ class TRIZChain:
         brief: InterviewBrief | None = None,
         profile: AnalysisProfile | None = None,
         on_progress: Callable[[int, str], None] | None = None,
+        on_stage_complete: Callable[[str, dict], None] | None = None,
     ) -> dict:
         """
         Пайплайн TRIZ-анализа:
@@ -901,6 +927,7 @@ class TRIZChain:
             validator_notes=core_notes,
             duration_ms=int((time.perf_counter() - t0) * 1000),
         )
+        _emit_stage_complete(on_stage_complete, "core_analysis", dict(core))
 
         # --- psa_fp_validation ---
         t0 = time.perf_counter()
@@ -928,10 +955,12 @@ class TRIZChain:
             validator_notes=fp_notes,
             duration_ms=int((time.perf_counter() - t0) * 1000),
         )
+        _emit_stage_complete(on_stage_complete, "psa_fp_validation", _psa_fp_snapshot(core))
 
         # --- effects_retrieval ---
         t0 = time.perf_counter()
         _progress(45, "Подбор физических эффектов")
+        effects_queries: list[str] = []
         if not resolved_profile.effects_rag:
             effects_block, effects_used = "", []
             if profile is not None and settings.effects_rag_enabled:
@@ -939,7 +968,7 @@ class TRIZChain:
             else:
                 effects_notes = ["отключён"]
         else:
-            effects_block, effects_used = self._retrieve_effects_for_solutions(
+            effects_block, effects_used, effects_queries = self._retrieve_effects_for_solutions(
                 core, profile=resolved_profile
             )
             effects_notes = []
@@ -955,6 +984,15 @@ class TRIZChain:
             tools_used=list(effects_used),
             validator_notes=effects_notes,
             duration_ms=int((time.perf_counter() - t0) * 1000),
+        )
+        _emit_stage_complete(
+            on_stage_complete,
+            "effects_retrieval",
+            {
+                "effects_block": effects_block,
+                "effects_used": list(effects_used),
+                "queries": list(effects_queries),
+            },
         )
 
         # --- solution_generation ---
@@ -978,6 +1016,14 @@ class TRIZChain:
             tools_used=_extract_solution_principles(solutions),
             validator_notes=sol_notes,
             duration_ms=int((time.perf_counter() - t0) * 1000),
+        )
+        _emit_stage_complete(
+            on_stage_complete,
+            "solution_generation",
+            {
+                "solutions": [dict(s) if isinstance(s, dict) else s for s in solutions],
+                "generation_warning": generation_warning or "",
+            },
         )
 
         # --- assembly ---

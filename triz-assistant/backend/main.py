@@ -20,6 +20,7 @@ from backend.config import settings
 from backend.chat_service import ChatService, ChatServiceError
 from backend.chat_store import ChatStore
 from backend.llm.chain import TRIZChain, TRIZChainError
+from backend.llm.models import StageArtifact
 
 from backend.schemas import (
     ActiveChatStateResponse,
@@ -48,10 +49,17 @@ from backend.schemas import (
     SolveJobProgress,
     SolveRequest,
     SolveResponse,
+    StageArtifactListResponse,
+    StageArtifactMeta,
     ToolRegistryItem,
     UserInfo,
 )
 from backend.sessions_store import SessionsStore
+from backend.artifacts_store import ArtifactsStore
+from backend.stage_artifact_hooks import (
+    make_artifact_buffer,
+    persist_buffered_artifacts,
+)
 from backend.solve_jobs import solve_jobs
 from backend.rate_limit import client_ip_from_request, login_rate_limiter
 from backend.reports import build_report_docx, build_report_html
@@ -85,6 +93,10 @@ def get_chat_service() -> ChatService:
 
 def get_sessions_store() -> SessionsStore:
     return SessionsStore()
+
+
+def get_artifacts_store() -> ArtifactsStore:
+    return ArtifactsStore()
 
 
 def _clear_active_chat_if_deleted(
@@ -128,20 +140,31 @@ def _run_solve_job(
         analysis_progress.update(job_id, pct, stage)
         solve_jobs.update_progress(job_id, pct, stage)
 
+    on_stage_complete, artifact_buffer, profile_hash = make_artifact_buffer(analysis_profile)
+    artifacts_store = get_artifacts_store()
+
     try:
         result = chain.solve(
             problem,
             brief=interview_brief,
             profile=analysis_profile,
             on_progress=on_progress,
+            on_stage_complete=on_stage_complete,
         )
         if chat_session_id:
             chat_store.mark_analyzed(chat_session_id, problem)
-        store.add_entry(
+        entry = store.add_entry(
             problem,
             result,
             chat_session_id=chat_session_id,
             user_id=user_id,
+        )
+        persist_buffered_artifacts(
+            artifacts_store,
+            entry["id"],
+            user_id,
+            profile_hash,
+            artifact_buffer,
         )
         solve_jobs.complete(job_id, result)
         analysis_progress.complete(job_id)
@@ -253,7 +276,7 @@ def root() -> dict[str, str]:
         "service": "TRIZ AI Assistant",
         "docs": "/docs",
         "health": "/health",
-        "solve": "POST /solve, POST /solve/jobs, GET /solve/jobs/{job_id}",
+        "solve": "POST /solve, POST /solve/jobs, GET /solve/jobs/{job_id}, GET /solve/entries/{entry_id}/artifacts",
         "chat": "GET/POST /chat/sessions, DELETE /chat/sessions, POST /chat/sessions/bulk-delete, GET /chat/sessions/{id}, ...",
         "sessions": "GET/POST/PUT/DELETE /sessions",
         "auth": "POST /auth/login, GET /auth/me",
@@ -351,8 +374,20 @@ def solve_problem(
 
     Deprecated: предпочтительно POST /solve/jobs + GET /solve/jobs/{job_id}.
     """
-    result = chain.solve(body.problem, profile=body.profile)
-    store.add_entry(body.problem, result, user_id=user["id"])
+    on_stage_complete, artifact_buffer, profile_hash = make_artifact_buffer(body.profile)
+    result = chain.solve(
+        body.problem,
+        profile=body.profile,
+        on_stage_complete=on_stage_complete,
+    )
+    entry = store.add_entry(body.problem, result, user_id=user["id"])
+    persist_buffered_artifacts(
+        get_artifacts_store(),
+        entry["id"],
+        user["id"],
+        profile_hash,
+        artifact_buffer,
+    )
     return SolveResponse(**result)
 
 
@@ -425,6 +460,43 @@ def get_solve_job(
         result=result,
         error=job.error,
     )
+
+
+@app.get(
+    "/solve/entries/{entry_id}/artifacts",
+    response_model=StageArtifactListResponse,
+    tags=["triz"],
+    summary="Метаданные артефактов этапов анализа",
+)
+def list_stage_artifacts(
+    entry_id: str,
+    user: CurrentUser,
+    artifacts_store: ArtifactsStore = Depends(get_artifacts_store),
+) -> StageArtifactListResponse:
+    rows = artifacts_store.list_metadata(entry_id, user_id=user["id"])
+    if rows is None:
+        raise HTTPException(status_code=404, detail="Запись не найдена.")
+    return StageArtifactListResponse(
+        items=[StageArtifactMeta(**row) for row in rows],
+    )
+
+
+@app.get(
+    "/solve/entries/{entry_id}/artifacts/{step_id}",
+    response_model=StageArtifact,
+    tags=["triz"],
+    summary="Полный артефакт этапа анализа",
+)
+def get_stage_artifact(
+    entry_id: str,
+    step_id: str,
+    user: CurrentUser,
+    artifacts_store: ArtifactsStore = Depends(get_artifacts_store),
+) -> StageArtifact:
+    artifact = artifacts_store.get(entry_id, step_id, user_id=user["id"])
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Артефакт не найден.")
+    return artifact
 
 
 @app.get(
@@ -581,8 +653,21 @@ def analyze_chat_session(
     store: SessionsStore = Depends(get_sessions_store),
 ) -> ChatAnalyzeResponse:
     opts = body or ChatAnalyzeRequest()
-    result, brief = chat.analyze(session_id, user["id"], force=opts.force)
-    store.add_entry(brief, result, chat_session_id=session_id, user_id=user["id"])
+    on_stage_complete, artifact_buffer, profile_hash = make_artifact_buffer(None)
+    result, brief = chat.analyze(
+        session_id,
+        user["id"],
+        force=opts.force,
+        on_stage_complete=on_stage_complete,
+    )
+    entry = store.add_entry(brief, result, chat_session_id=session_id, user_id=user["id"])
+    persist_buffered_artifacts(
+        get_artifacts_store(),
+        entry["id"],
+        user["id"],
+        profile_hash,
+        artifact_buffer,
+    )
     return ChatAnalyzeResponse(
         session_id=session_id,
         brief=brief,

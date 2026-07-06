@@ -206,7 +206,7 @@ class TestEffectsPromptParity:
             lambda: MockRetriever(),
         )
 
-        effects_block, names = chain_with_fake_llm._retrieve_effects_for_solutions(
+        effects_block, names, _queries = chain_with_fake_llm._retrieve_effects_for_solutions(
             CORE_FIXTURE,
             profile=AnalysisProfile.default_profile().model_copy(update={"effects_rag": True}),
         )

@@ -1,5 +1,7 @@
 """Pydantic-модели экспертного TRIZ-отчёта (structured output LLM)."""
 
+import hashlib
+import json
 from typing import Literal
 
 from pydantic import BaseModel, Field, computed_field
@@ -517,6 +519,21 @@ class PipelineStepTrace(BaseModel):
     tools_used: list[str]
     validator_notes: list[str]
     duration_ms: int
+
+
+class StageArtifact(BaseModel):
+    """Снимок промежуточного состояния пайплайна TRIZChain.solve."""
+
+    step_id: str
+    payload: dict
+    created_at: str
+    profile_hash: str
+
+
+def compute_profile_hash(profile: AnalysisProfile) -> str:
+    """SHA-256 хеш канонически сериализованного AnalysisProfile."""
+    canonical = json.dumps(profile.model_dump(), sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def enrich_legacy_fields(payload: dict) -> dict:

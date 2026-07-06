@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from typing import Any
 
 from backend.analysis_progress import analysis_progress
 from backend.chat_store import STATUS_ANALYZED, STATUS_INTERVIEW, STATUS_READY, ChatStore
@@ -89,7 +91,14 @@ class ChatService:
 
         return problem, interview_brief
 
-    def analyze(self, session_id: str, user_id: str, *, force: bool = False) -> tuple[dict, str]:
+    def analyze(
+        self,
+        session_id: str,
+        user_id: str,
+        *,
+        force: bool = False,
+        on_stage_complete: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> tuple[dict, str]:
         problem, interview_brief = self.prepare_analyze(session_id, user_id, force=force)
 
         logger.info(
@@ -103,7 +112,12 @@ class ChatService:
             analysis_progress.update(session_id, pct, stage)
 
         try:
-            result = self._chain.solve(problem, brief=interview_brief, on_progress=on_progress)
+            result = self._chain.solve(
+                problem,
+                brief=interview_brief,
+                on_progress=on_progress,
+                on_stage_complete=on_stage_complete,
+            )
             self._store.mark_analyzed(session_id, problem)
             analysis_progress.complete(session_id)
             return result, problem
