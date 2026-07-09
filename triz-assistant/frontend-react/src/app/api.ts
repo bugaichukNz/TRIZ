@@ -1,4 +1,5 @@
 ﻿import { createApi, fetchBaseQuery } from '@reduxjs/toolkit/query/react'
+import { extractVisibleAssistantContent } from '../features/chat/interviewMessageUtils'
 import { clearAuthSession, getAuthToken } from './authToken'
 import type {
   ActiveChatStateResponse,
@@ -302,11 +303,22 @@ export const {
 
 /** Видимые сообщения чата (без служебных system/context) */
 export function filterVisibleMessages(messages: ChatMessage[]): ChatMessage[] {
-  return messages.filter((m) => {
-    if (m.role === 'system') return false
-    if (m.role === 'assistant' && m.content.startsWith('[КОНТЕКСТ:')) return false
-    return true
-  })
+  const visible: ChatMessage[] = []
+
+  for (const message of messages) {
+    if (message.role === 'system') continue
+
+    if (message.role === 'assistant') {
+      const content = extractVisibleAssistantContent(message.content)
+      if (!content) continue
+      visible.push(content === message.content ? message : { ...message, content })
+      continue
+    }
+
+    visible.push(message)
+  }
+
+  return visible
 }
 
 export function isTRIZResult(value: unknown): value is TRIZAnalysisResult {

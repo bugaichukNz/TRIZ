@@ -45,6 +45,7 @@ import {
   useSetActiveChatMutation,
 
 } from '../../app/api'
+import { useAppDispatch } from '../../app/store'
 
 import type { AnalysisProfile } from '../../types/triz'
 
